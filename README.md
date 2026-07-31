@@ -112,9 +112,21 @@ pytest -q      # 14 passing — no Docker required
 The data-access tests run against an in-memory Mongo (`mongomock-motor`), so query logic is
 genuinely exercised rather than mocked. Docker is only needed for the live end-to-end run.
 
-> **SDK note:** this targets **MCP SDK 2.x**, where the server class is `MCPServer`
-> (`mcp.server.mcpserver`). The 1.x `FastMCP` import path no longer exists — most tutorials
-> online still show the old one.
+### Two SDK notes worth knowing before you read the code
+
+**1. MCP SDK 2.x.** The server class is `MCPServer` (`mcp.server.mcpserver`); the 1.x `FastMCP`
+import path no longer exists, and `Tool.inputSchema` is now `Tool.input_schema`. Most tutorials
+online still show the 1.x forms.
+
+**2. No `langchain-mcp-adapters`.** The obvious way to feed MCP tools to a LangChain agent is that
+package — but as of its latest release (0.3.1) it imports `mcp.server.fastmcp.tools`, the module
+MCP 2.0 removed, so it raises `ModuleNotFoundError` against a current SDK. pip does not catch this
+because its `mcp` dependency is unpinned.
+
+The choice was to pin this project to a superseded SDK, or to own the glue.
+[`src/agent/mcp_tools.py`](src/agent/mcp_tools.py) is the glue — ~50 lines that read the tool list
+off a live MCP session and wrap each as a LangChain `StructuredTool`. It depends on nothing beyond
+the two SDKs themselves.
 
 ## Status
 
@@ -123,8 +135,8 @@ tests, and `RETRO.md` for sprint retrospectives.
 
 - [x] **Phase 0** — project skeleton, Compose, config, health check
 - [x] **Phase 1** — domain model, Mongo collections, synthetic seed
-- [x] **Phase 2** — MCP server, 4 read tools *(14 tests passing)*
-- [ ] **Phase 3** — LangGraph agent + `langchain-mcp-adapters`
+- [x] **Phase 2** — MCP server, 4 read tools
+- [x] **Phase 3** — agent loop, MCP→LangChain bridge, chat endpoint *(22 tests passing)*
 - [ ] **Phase 4** — conversation state + append-only tool audit
 - [ ] **Phase 5** — write tools + human-in-the-loop approval
 - [ ] **Phase 6** — 🎯 MVP cut: README, diagram, one-command demo

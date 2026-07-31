@@ -17,9 +17,12 @@ dependencies = [
     "pymongo>=4.9",
     # Tools / agent
     "mcp>=2.0",
-    "langchain>=0.3",
-    "langgraph>=0.2",
-    "langchain-mcp-adapters>=0.1",
+    "langchain>=1.0",
+    "langgraph>=1.0",
+    # NOTE: langchain-mcp-adapters is deliberately NOT a dependency. As of its
+    # latest release (0.3.1) it imports mcp.server.fastmcp.tools, removed in MCP
+    # SDK 2.0, so it cannot be imported against a current SDK. src/agent/mcp_tools.py
+    # is a ~50-line replacement. Revisit if upstream ships MCP 2.x support.
     # Messaging
     "aiokafka>=0.12",
     # Observability

@@ -5,13 +5,16 @@ approval endpoints are stubbed with their contracts defined; fill them in at
 Phase 3 and Phase 5.
 """
 
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
+from langgraph.checkpoint.memory import InMemorySaver
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 from starlette.responses import Response
 
+from src.agent.graph import agent_session
 from src.config import get_settings
 from src.db import mongo
 
@@ -20,8 +23,21 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Own the MCP session for the process lifetime.
+
+    The agent's tools close over a live MCP client, so the session has to
+    outlive a single request — building an agent per request would reconnect
+    MCP on every message. One session, opened at startup, closed at shutdown.
+    """
     await mongo.ensure_indexes()
-    yield
+
+    async with AsyncExitStack() as stack:
+        # TODO(Phase 4): swap InMemorySaver for a Mongo-backed checkpointer so
+        # conversations survive a restart and can be audited after the fact.
+        app.state.agent = await stack.enter_async_context(
+            agent_session(checkpointer=InMemorySaver())
+        )
+        yield
 
 
 app = FastAPI(
@@ -80,20 +96,51 @@ class ApprovalIn(BaseModel):
     reason: str | None = None
 
 
+def _approval_envelope(interrupts: list[Any]) -> dict:
+    """Render a paused write as something a caller can act on.
+
+    Deliberately explicit that nothing has happened yet — the most damaging
+    thing this API could do is let a client render "case created" for a write
+    still sitting in a queue awaiting a human.
+    """
+    requests = [req for interrupt in interrupts for req in interrupt.value["action_requests"]]
+    return {
+        "status": "awaiting_approval",
+        "message": (
+            "This action changes customer records and is waiting for a human reviewer. "
+            "Nothing has been written yet."
+        ),
+        "pending_actions": [{"tool": r["name"], "arguments": r["args"]} for r in requests],
+    }
+
+
 @app.post("/sessions/{session_id}/messages", tags=["agent"])
 async def send_message(session_id: str, body: MessageIn) -> dict:
     """Send a servicing request to the agent.
 
     Returns either the agent's answer, or a pending-approval envelope when the
-    agent wants to call a write tool:
-
-        {"status": "awaiting_approval",
-         "pending_tool": "create_servicing_case",
-         "arguments": {...}}
+    agent has asked to call a write tool. The write does not execute until
+    POST /sessions/{id}/approve.
     """
-    # TODO(Phase 3): run the LangGraph agent, persist conversation state.
-    # TODO(Phase 5): surface interrupt() as the awaiting_approval envelope.
-    raise HTTPException(status_code=501, detail="Phase 3: agent loop not implemented yet")
+    result = await app.state.agent.ainvoke(
+        {"messages": [("user", body.message)]},
+        config={"configurable": {"thread_id": session_id}},
+    )
+
+    if interrupts := result.get("__interrupt__"):
+        return _approval_envelope(interrupts)
+
+    return {
+        "status": "ok",
+        "reply": result["messages"][-1].content,
+        # Which tools actually ran, for the caller and for debugging. The
+        # authoritative record is the Phase 4 audit collection, not this.
+        "tools_called": [
+            call["name"]
+            for message in result["messages"]
+            for call in (getattr(message, "tool_calls", None) or [])
+        ],
+    }
 
 
 @app.post("/sessions/{session_id}/approve", tags=["agent"])

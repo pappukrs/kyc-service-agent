@@ -1,20 +1,84 @@
 """LangGraph agent loop.
 
 Shape:
-    plan -> call tool -> observe -> repeat, with interrupt() before any write.
+    plan → call tool → observe → repeat, pausing before any write.
 
-Tools are loaded from the MCP server via langchain-mcp-adapters, so the agent
-never imports a repository or touches Mongo directly. That indirection is what
-makes the audit trail complete and the runtime swappable (see src/agent/adk.py).
+Tools come from the MCP server via `src.agent.mcp_tools`, so the agent never
+imports a repository and never touches Mongo directly. That indirection is what
+makes the Phase 4 audit trail complete and the runtime swappable — the Phase 11
+Google ADK port binds the same MCP tools and needs no change below this line.
 """
 
+from contextlib import asynccontextmanager
+from typing import Any
 
-async def build_agent():
-    """Build the compiled LangGraph agent with MCP tools attached."""
-    # TODO(Phase 3):
-    #   1. start/connect the MCP server session
-    #   2. load tools via langchain_mcp_adapters.tools.load_mcp_tools
-    #   3. create_react_agent(build_llm(), tools, checkpointer=<mongo saver>)
-    # TODO(Phase 5): interrupt_before the write tools so the API can surface
-    #   an approval envelope and resume on POST /sessions/{id}/approve.
-    raise NotImplementedError("Phase 3")
+# LangGraph 1.0 moved the prebuilt agent to langchain.agents.create_agent;
+# langgraph.prebuilt.create_react_agent still imports but emits a deprecation
+# warning and goes away in 2.0. Note the kwarg renamed too: prompt → system_prompt.
+from langchain.agents import create_agent
+from langchain.agents.middleware import HumanInTheLoopMiddleware
+
+from src.agent.llm import build_llm
+from src.agent.mcp_tools import connect, load_mcp_tools, load_read_tools
+from src.agent.prompt import SYSTEM_PROMPT
+from src.mcp_server.server import mcp
+
+# Tools that mutate state. Execution halts *before* these run, so the API can
+# surface an approval envelope and resume only on an explicit decision.
+#
+# This is the structural half of the write guard — the prompt tells the agent to
+# expect the pause, but the pause does not depend on the model obeying anything.
+# A guardrail that lives only in a prompt is not a guardrail.
+#
+# Note this is per-tool, not per-node: every tool shares a single graph node, so
+# the graph-level `interrupt_before` would gate reads too. HumanInTheLoopMiddleware
+# is the mechanism that discriminates by tool name.
+WRITE_TOOLS: tuple[str, ...] = ("create_servicing_case", "update_customer_contact")
+
+
+@asynccontextmanager
+async def agent_session(
+    *,
+    model: Any = None,
+    read_only: bool = False,
+    checkpointer: Any = None,
+    server: Any = None,
+):
+    """Yield a compiled agent bound to a live MCP session.
+
+    The MCP client is a context manager, and the tools close over it — so the
+    agent is only valid inside this block. Hence a context manager rather than a
+    plain `build_agent()`: it makes the tool session's lifetime explicit instead
+    of leaving a half-dead agent object lying around.
+
+    Args:
+        model: a LangChain chat model. Defaults to the configured provider;
+            tests pass a fake so the graph is exercised without an API key.
+        read_only: bind only the four read tools. An agent that was never given
+            a write tool cannot be talked into calling one — defence in depth
+            alongside the approval gate.
+        checkpointer: LangGraph checkpointer for conversation state (Phase 4).
+        server: MCPServer to connect to. Defaults to this project's server.
+    """
+    async with connect(server or mcp) as client:
+        tools = await (load_read_tools(client) if read_only else load_mcp_tools(client))
+
+        # No approval gate in read-only mode — there is nothing to guard.
+        middleware = (
+            ()
+            if read_only
+            else (
+                HumanInTheLoopMiddleware(
+                    interrupt_on={name: True for name in WRITE_TOOLS},
+                    description_prefix="This action changes customer records and needs approval",
+                ),
+            )
+        )
+
+        yield create_agent(
+            model=model if model is not None else build_llm(),
+            tools=tools,
+            system_prompt=SYSTEM_PROMPT,
+            checkpointer=checkpointer,
+            middleware=middleware,
+        )
