@@ -9,21 +9,22 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from langgraph.checkpoint.memory import InMemorySaver
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 from starlette.responses import Response
 
+from src.agent.checkpoint import checkpointer
 from src.agent.graph import agent_session
 from src.config import get_settings
 from src.db import mongo
+from src.obs import audit
 
 settings = get_settings()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Own the MCP session for the process lifetime.
+    """Own the MCP session and the checkpointer for the process lifetime.
 
     The agent's tools close over a live MCP client, so the session has to
     outlive a single request — building an agent per request would reconnect
@@ -32,11 +33,8 @@ async def lifespan(app: FastAPI):
     await mongo.ensure_indexes()
 
     async with AsyncExitStack() as stack:
-        # TODO(Phase 4): swap InMemorySaver for a Mongo-backed checkpointer so
-        # conversations survive a restart and can be audited after the fact.
-        app.state.agent = await stack.enter_async_context(
-            agent_session(checkpointer=InMemorySaver())
-        )
+        saver = await stack.enter_async_context(checkpointer())
+        app.state.agent = await stack.enter_async_context(agent_session(checkpointer=saver))
         yield
 
 
@@ -122,25 +120,44 @@ async def send_message(session_id: str, body: MessageIn) -> dict:
     agent has asked to call a write tool. The write does not execute until
     POST /sessions/{id}/approve.
     """
+    # One correlation id for this request; every tool call the agent makes
+    # while handling it shares the id, so the trail can be grouped by turn as
+    # well as by session.
+    correlation_id = audit.new_correlation_id()
+
     result = await app.state.agent.ainvoke(
         {"messages": [("user", body.message)]},
         config={"configurable": {"thread_id": session_id}},
     )
 
     if interrupts := result.get("__interrupt__"):
-        return _approval_envelope(interrupts)
+        return _approval_envelope(interrupts) | {"correlation_id": correlation_id}
 
     return {
         "status": "ok",
         "reply": result["messages"][-1].content,
-        # Which tools actually ran, for the caller and for debugging. The
-        # authoritative record is the Phase 4 audit collection, not this.
+        "correlation_id": correlation_id,
+        # Convenience for the caller and for debugging. The authoritative
+        # record is the tool_audit collection — see GET .../audit below.
         "tools_called": [
             call["name"]
             for message in result["messages"]
             for call in (getattr(message, "tool_calls", None) or [])
         ],
     }
+
+
+@app.get("/sessions/{session_id}/audit", tags=["agent"])
+async def session_audit(session_id: str) -> dict:
+    """Every tool call made in this session, oldest first.
+
+    The reconstruction path: this is what you show someone asking "why did it
+    tell the customer that?". Results are hashed, not stored, and personal-data
+    arguments are redacted — the trail proves what happened without becoming a
+    second copy of the customer database.
+    """
+    trail = await audit.read_session_trail(session_id)
+    return {"session_id": session_id, "tool_calls": len(trail), "trail": trail}
 
 
 @app.post("/sessions/{session_id}/approve", tags=["agent"])

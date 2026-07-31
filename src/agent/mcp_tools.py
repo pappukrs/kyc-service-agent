@@ -23,11 +23,15 @@ observable, which is what makes the Phase 4 audit trail complete.
 """
 
 import json
+import time
 from typing import Any
 
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import StructuredTool
 from mcp.client.client import Client
 from mcp.server.mcpserver import MCPServer
+
+from src.obs import audit
 
 
 def _flatten_result(result: Any) -> str:
@@ -52,14 +56,36 @@ def _flatten_result(result: Any) -> str:
 def _make_tool(
     client: Client, name: str, description: str, schema: dict[str, Any]
 ) -> StructuredTool:
-    async def _call(**kwargs: Any) -> str:
+    async def _call(config: RunnableConfig, **kwargs: Any) -> str:
+        # LangChain injects RunnableConfig into a tool coroutine that declares
+        # it. That is how the session id reaches the audit layer without the
+        # tool wrapper having to know anything about the API above it.
+        session_id = (config.get("configurable") or {}).get("thread_id", "unknown")
+
+        started = time.perf_counter()
         result = await client.call_tool(name, kwargs)
+        latency_ms = int((time.perf_counter() - started) * 1000)
+
         # A tool-level error is data, not an exception: the agent should read it
         # and recover (ask a clarifying question, try another tool) rather than
         # having the turn blow up underneath it.
-        if getattr(result, "is_error", False):
-            return f"TOOL_ERROR from {name}: {_flatten_result(result)}"
-        return _flatten_result(result)
+        is_error = bool(getattr(result, "is_error", False))
+        payload = _flatten_result(result)
+        rendered = f"TOOL_ERROR from {name}: {payload}" if is_error else payload
+
+        # Every tool call is audited — including the failures, which are the
+        # ones you most want a record of.
+        await audit.record_tool_call(
+            session_id=session_id,
+            tool_name=name,
+            arguments=kwargs,
+            result=rendered,
+            latency_ms=latency_ms,
+            is_error=is_error,
+            error_message=payload if is_error else None,
+        )
+
+        return rendered
 
     return StructuredTool(
         name=name,

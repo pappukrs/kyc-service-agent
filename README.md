@@ -103,14 +103,36 @@ All seven tools are registered; the four read tools are implemented. `list_kyc_d
 against a customer with a rejected document returns the rejection reason verbatim — that string
 is usually the whole answer to *"why am I blocked?"*.
 
+### The audit trail
+
+Every tool call the agent makes is appended to `tool_audit` — one immutable row, never updated,
+never deleted. Read a session's trail back with:
+
+```bash
+curl localhost:8000/sessions/<session-id>/audit
+```
+
+Three rules make it an audit log rather than a second copy of the customer database:
+
+- **Append-only.** `insert_one` and nothing else. There is no update or delete path.
+- **Results are hashed, not stored.** The SHA-256 proves *what* the agent saw without persisting it.
+- **Personal-data arguments are redacted.** The subtle one: `update_customer_contact(field="email",
+  value=...)` carries the new address *in its arguments*, so hashing the result but logging raw
+  args would leak precisely the field the write was about. Keys are kept, values replaced.
+
+An audit write failing never breaks a customer's turn — it is logged and swallowed. A deliberate
+trade for a servicing assistant; a system that moved money would fail closed instead.
+
 ### Tests
 
 ```bash
-pytest -q      # 14 passing — no Docker required
+pytest -q      # 41 passing — no Docker, no API key
 ```
 
-The data-access tests run against an in-memory Mongo (`mongomock-motor`), so query logic is
-genuinely exercised rather than mocked. Docker is only needed for the live end-to-end run.
+Data-access tests run against an in-memory Mongo (`mongomock-motor`) and agent tests drive a
+scripted fake model, so the wiring is genuinely exercised rather than mocked. What these *don't*
+cover is model judgement — "did it pick the right tool for this question?" needs a real model, and
+that's what the Phase 9 eval suite is for. Docker is only needed for the live end-to-end run.
 
 ### Two SDK notes worth knowing before you read the code
 
@@ -136,8 +158,8 @@ tests, and `RETRO.md` for sprint retrospectives.
 - [x] **Phase 0** — project skeleton, Compose, config, health check
 - [x] **Phase 1** — domain model, Mongo collections, synthetic seed
 - [x] **Phase 2** — MCP server, 4 read tools
-- [x] **Phase 3** — agent loop, MCP→LangChain bridge, chat endpoint *(22 tests passing)*
-- [ ] **Phase 4** — conversation state + append-only tool audit
+- [x] **Phase 3** — agent loop, MCP→LangChain bridge, chat endpoint
+- [x] **Phase 4** — Mongo-backed conversation state + append-only tool audit *(41 tests passing)*
 - [ ] **Phase 5** — write tools + human-in-the-loop approval
 - [ ] **Phase 6** — 🎯 MVP cut: README, diagram, one-command demo
 - [ ] **Phase 7** — Kafka producer + worker, async document verification
