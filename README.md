@@ -84,11 +84,37 @@ agent only ever talks to tools, so swapping providers touches one function.
 ```bash
 cp .env.example .env          # fill in your model provider + key
 docker compose up -d          # MongoDB + Kafka
-uv sync                       # or: pip install -e ".[dev]"
+pip install -e ".[dev]"       # or: uv sync
 python -m scripts.seed        # ~50 synthetic customers
 uvicorn src.api.main:app --reload
 curl localhost:8000/healthz
 ```
+
+### Inspecting the tools
+
+The MCP server runs standalone over stdio, so you can drive it without the agent:
+
+```bash
+make mcp                                        # or: python -m src.mcp_server.server
+npx @modelcontextprotocol/inspector python -m src.mcp_server.server
+```
+
+All seven tools are registered; the four read tools are implemented. `list_kyc_documents`
+against a customer with a rejected document returns the rejection reason verbatim — that string
+is usually the whole answer to *"why am I blocked?"*.
+
+### Tests
+
+```bash
+pytest -q      # 14 passing — no Docker required
+```
+
+The data-access tests run against an in-memory Mongo (`mongomock-motor`), so query logic is
+genuinely exercised rather than mocked. Docker is only needed for the live end-to-end run.
+
+> **SDK note:** this targets **MCP SDK 2.x**, where the server class is `MCPServer`
+> (`mcp.server.mcpserver`). The 1.x `FastMCP` import path no longer exists — most tutorials
+> online still show the old one.
 
 ## Status
 
@@ -96,8 +122,8 @@ Built in two sprints; see [`docs/PLAN.md`](docs/PLAN.md) for the phase-by-phase 
 tests, and `RETRO.md` for sprint retrospectives.
 
 - [x] **Phase 0** — project skeleton, Compose, config, health check
-- [ ] **Phase 1** — domain model, Mongo collections, synthetic seed
-- [ ] **Phase 2** — MCP server, 4 read tools
+- [x] **Phase 1** — domain model, Mongo collections, synthetic seed
+- [x] **Phase 2** — MCP server, 4 read tools *(14 tests passing)*
 - [ ] **Phase 3** — LangGraph agent + `langchain-mcp-adapters`
 - [ ] **Phase 4** — conversation state + append-only tool audit
 - [ ] **Phase 5** — write tools + human-in-the-loop approval

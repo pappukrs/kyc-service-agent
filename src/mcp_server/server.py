@@ -18,11 +18,37 @@ accuracy — the model reads these to decide.
 Run standalone:  python -m src.mcp_server.server
 """
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-from src.db import mongo
+from src.db import mongo, repositories
 
-mcp = FastMCP("kyc-servicing")
+# MCP SDK 2.x: MCPServer replaces the 1.x `FastMCP` class. Same decorator
+# ergonomics — @mcp.tool() — but imported from mcp.server.mcpserver.
+mcp = MCPServer(
+    "kyc-servicing",
+    instructions=(
+        "Servicing tools for retail-banking onboarding and KYC. Read tools are "
+        "safe to call freely. Write tools require human approval and must never "
+        "be called speculatively. There is no tool for moving money, checking "
+        "balances, or altering accounts — if asked, say so plainly."
+    ),
+)
+
+
+def _not_found(customer_id: str) -> dict:
+    """Uniform not-found result.
+
+    Returned as data rather than raised: the agent should tell the customer the
+    record could not be found, not crash the turn — and it must not invent one.
+    """
+    return {
+        "error": "customer_not_found",
+        "customer_id": customer_id,
+        "message": (
+            f"No customer with id {customer_id}. Ask the customer to confirm their "
+            f"customer id. Do not guess or substitute another id."
+        ),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -38,8 +64,8 @@ async def get_customer(customer_id: str) -> dict:
     not yet have their details in context. Prefer get_onboarding_status when
     the question is specifically about progress or blockers.
     """
-    doc = await mongo.get_db().customers.find_one({"customer_id": customer_id}, {"_id": 0})
-    return doc or {"error": "not_found", "customer_id": customer_id}
+    customer = await repositories.find_customer(mongo.get_db(), customer_id)
+    return customer or _not_found(customer_id)
 
 
 @mcp.tool()
@@ -51,8 +77,8 @@ async def get_onboarding_status(customer_id: str) -> dict:
     about a *document*, use list_kyc_documents instead — it carries the
     rejection reasons.
     """
-    # TODO(Phase 2): derive blockers from stage + pending/rejected documents.
-    raise NotImplementedError("Phase 2")
+    status = await repositories.build_onboarding_status(mongo.get_db(), customer_id)
+    return status or _not_found(customer_id)
 
 
 @mcp.tool()
@@ -63,8 +89,13 @@ async def list_kyc_documents(customer_id: str) -> list[dict]:
     onboarding is blocked, or what they still need to submit. This is the tool
     that carries rejection_reason — the usual answer to "why am I stuck?".
     """
-    # TODO(Phase 2): query kyc_documents by customer_id.
-    raise NotImplementedError("Phase 2")
+    db = mongo.get_db()
+    if await repositories.find_customer(db, customer_id) is None:
+        # Distinguish "no such customer" from "customer with no documents".
+        # Returning [] for both would let the agent tell someone their
+        # application is fine when it does not exist.
+        return [_not_found(customer_id)]
+    return await repositories.find_documents(db, customer_id)
 
 
 @mcp.tool()
@@ -75,9 +106,7 @@ async def search_servicing_kb(query: str) -> list[dict]:
     specific to one customer's record — "how long does verification take?",
     "which address proofs are accepted?". Do not use it to look up customer data.
     """
-    # TODO(Phase 2): keyword search over a seeded kb collection.
-    # Deliberately not a vector store — this is an agent project, not a RAG project.
-    raise NotImplementedError("Phase 2")
+    return await repositories.search_kb(mongo.get_db(), query)
 
 
 # --------------------------------------------------------------------------- #

@@ -16,7 +16,7 @@ dependencies = [
     "motor>=3.6",
     "pymongo>=4.9",
     # Tools / agent
-    "mcp>=1.2",
+    "mcp>=2.0",
     "langchain>=0.3",
     "langgraph>=0.2",
     "langchain-mcp-adapters>=0.1",
