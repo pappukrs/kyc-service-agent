@@ -72,14 +72,25 @@ passes through, successes and failures alike.
 Both write tools implemented, idempotent within a correlation scope. `POST /sessions/{id}/approve`
 resumes or rejects a paused run; approving with nothing pending is a 409 rather than a silent no-op.
 
+### Phase 6 — Presentation (MVP cut)
+Nothing new functionally — this is the phase that makes the work legible to someone who won't read
+the source. Rendered diagrams in [`architecture.md`](./architecture.md) (components, the approval
+gate as a sequence, the shape of an audit row), and `make demo`, which takes a clean clone to a
+working demonstration in one command.
+
+The demo drives the API over HTTP rather than reaching into the agent, so whatever it proves is
+proven at the boundary a caller actually sees; and it establishes ground truth by reading Mongo
+directly *before* the agent runs, so its claims can be checked from outside the agent's own path.
+
+It is under test too, including a case asserting it can still fail — a walkthrough that prints ✓
+unconditionally proves nothing, and one nobody runs until interview day has quietly rotted.
+
+Deploying a public URL was originally scoped here; it moved to Phase 12 alongside the demo video,
+since neither changes the system and both are better done once it is finished.
+
 ---
 
 ## Remaining
-
-### Phase 6 — Presentation
-Architecture diagram (rendered, not ASCII), a demo script someone can follow in five minutes,
-deploy to Cloud Run or EC2. Nothing new functionally — this is the phase that makes the work legible
-to someone who won't read the source.
 
 ### Phase 7 — Async document verification
 `verify_kyc_document` currently raises. It should produce to `servicing.tasks` and return
@@ -105,7 +116,7 @@ there is no bound on how long it waits first.
 - **refusal** — out-of-scope requests declined rather than hallucinating a capability
 
 This is the phase that tests *judgement* rather than wiring, and it needs a real model. The existing
-57 tests deliberately cover only mechanics; conflating the two would make both weaker.
+63 tests deliberately cover only mechanics; conflating the two would make both weaker.
 
 ### Phase 10 — Observability
 Structured JSON logs carrying the correlation id, PII redaction at the log boundary, Prometheus

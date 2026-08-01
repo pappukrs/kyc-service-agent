@@ -53,6 +53,10 @@ MCP tool with an explicit contract. That is what makes the audit trail complete,
 model enforceable, and the agent framework swappable — the same tool surface runs under LangGraph
 and under Google ADK.
 
+📐 **[`docs/architecture.md`](docs/architecture.md)** has the rendered diagrams: components, the
+approval gate as a sequence, what one turn writes to the audit trail, and why MCP rather than
+functions bound straight to the agent — including what that indirection costs.
+
 ## Tool surface
 
 Seven tools, split by blast radius. **The read/write split is the security boundary.**
@@ -82,13 +86,50 @@ agent only ever talks to tools, so swapping providers touches one function.
 ## Quick start
 
 ```bash
-cp .env.example .env          # fill in your model provider + key
+cp .env.example .env          # set MODEL_PROVIDER + MODEL_API_KEY
+make demo                     # Mongo → seed → API → end-to-end walkthrough
+```
+
+`make demo` takes a clean clone to a working demonstration in one command: it starts MongoDB,
+installs dependencies, seeds ~50 synthetic customers, brings the API up, runs the walkthrough
+below against it over HTTP, and stops the API afterwards. Mongo is left running, so the second run
+takes seconds.
+
+No model key? `MODEL_PROVIDER=ollama` runs it against a local model instead. And the test suite
+needs neither a key nor Docker:
+
+```bash
+make test          # 63 passing, scripted model + in-memory Mongo
+```
+
+<details>
+<summary>Running the pieces by hand</summary>
+
+```bash
 docker compose up -d          # MongoDB + Kafka
 pip install -e ".[dev]"       # or: uv sync
 python -m scripts.seed        # ~50 synthetic customers
 uvicorn src.api.main:app --reload
 curl localhost:8000/healthz
+python -m scripts.demo        # the walkthrough, against an API you already have up
 ```
+
+</details>
+
+### The demo
+
+[`scripts/demo.py`](scripts/demo.py) drives the API exactly as a client would — nothing reaches
+into the agent, so whatever it proves is proven at the boundary a caller actually sees. Three acts,
+each ending in checks you can watch pass or fail:
+
+| Act | What it does | What it proves |
+|---|---|---|
+| **1 — Read path** | Prints the customer's real state from MongoDB *before* the agent runs, then asks *"why is my onboarding blocked?"* | The answer is grounded in tool results, and the audit trail names the tools that produced it |
+| **2 — Write path** | Approves with nothing pending (**409**), asks for a case, shows the pending envelope, checks the database is still clean, then approves | No write reaches the database without a human decision — and the trail records who made it |
+| **3 — Refusal** | Asks the agent to transfer ₹50,000 | Out of scope means the capability is *absent*, not disabled: there is no money-movement tool to call |
+
+The demo is itself under test ([`tests/test_demo_script.py`](tests/test_demo_script.py)), including
+a case asserting it can still *fail* — a walkthrough that prints ✓ unconditionally proves nothing.
 
 ### Inspecting the tools
 
@@ -157,13 +198,17 @@ trade for a servicing assistant; a system that moved money would fail closed ins
 ### Tests
 
 ```bash
-pytest -q      # 57 passing — no Docker, no API key
+pytest -q      # 63 passing — no Docker, no API key
 ```
 
 Data-access tests run against an in-memory Mongo (`mongomock-motor`) and agent tests drive a
-scripted fake model, so the wiring is genuinely exercised rather than mocked. What these *don't*
-cover is model judgement — "did it pick the right tool for this question?" needs a real model, and
-that's what the Phase 9 eval suite is for. Docker is only needed for the live end-to-end run.
+scripted fake model, so the wiring is genuinely exercised rather than mocked. The demo script runs
+under the same harness, over an in-process ASGI transport — a walkthrough nobody runs until
+interview day is a walkthrough that has quietly rotted.
+
+What these *don't* cover is model judgement — "did it pick the right tool for this question?" needs
+a real model, and that's what the Phase 9 eval suite is for. Docker is only needed for the live
+end-to-end run.
 
 ### Two SDK notes worth knowing before you read the code
 
@@ -183,16 +228,19 @@ the two SDKs themselves.
 
 ## Status
 
-Built in two sprints; see [`docs/PLAN.md`](docs/PLAN.md) for the phase-by-phase plan and acceptance
-tests, and `RETRO.md` for sprint retrospectives.
+**Sprint 1 is complete — Phases 0–6, the MVP cut.** The system runs end to end: ask a question, get
+a grounded answer; ask for a change, get a human-gated write. Everything after Phase 6 is upside.
+
+See [`docs/PLAN.md`](docs/PLAN.md) for the phase-by-phase plan and acceptance tests, and
+[`RETRO.md`](RETRO.md) for sprint retrospectives.
 
 - [x] **Phase 0** — project skeleton, Compose, config, health check
 - [x] **Phase 1** — domain model, Mongo collections, synthetic seed
 - [x] **Phase 2** — MCP server, 4 read tools
 - [x] **Phase 3** — agent loop, MCP→LangChain bridge, chat endpoint
 - [x] **Phase 4** — Mongo-backed conversation state + append-only tool audit
-- [x] **Phase 5** — write tools, idempotency, human-in-the-loop approval *(57 tests passing)*
-- [ ] **Phase 6** — 🎯 MVP cut: README, diagram, one-command demo
+- [x] **Phase 5** — write tools, idempotency, human-in-the-loop approval
+- [x] **Phase 6** — 🎯 **MVP cut**: rendered diagrams, `make demo`, tested walkthrough *(63 tests passing)*
 - [ ] **Phase 7** — Kafka producer + worker, async document verification
 - [ ] **Phase 8** — idempotency, per-tool timeout + retry policy
 - [ ] **Phase 9** — 15-scenario eval harness in CI

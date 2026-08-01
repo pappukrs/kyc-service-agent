@@ -1,4 +1,7 @@
-.PHONY: up down seed run worker test lint mcp
+.PHONY: demo up down seed run worker test lint mcp
+
+demo:    ## clean clone → working demo: Mongo, seed, API, end-to-end walkthrough
+	./scripts/demo.sh
 
 up:      ## start MongoDB + Kafka
 	docker compose up -d
