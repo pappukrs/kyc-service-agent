@@ -103,6 +103,37 @@ All seven tools are registered; the four read tools are implemented. `list_kyc_d
 against a customer with a rejected document returns the rejection reason verbatim — that string
 is usually the whole answer to *"why am I blocked?"*.
 
+### The approval gate
+
+Write tools never execute on the agent's say-so. When the agent asks to open a case or change a
+contact detail, the run **halts before the tool runs** and the API returns an envelope naming the
+pending action:
+
+```jsonc
+// POST /sessions/s1/messages  →
+{
+  "status": "awaiting_approval",
+  "message": "This action changes customer records and is waiting for a human reviewer.
+              Nothing has been written yet.",
+  "pending_actions": [{"tool": "create_servicing_case", "arguments": {…}}]
+}
+
+// POST /sessions/s1/approve  {"approve": true, "approver": "reviewer@bank.invalid"}
+```
+
+Four properties make this a gate rather than a suggestion:
+
+- **The pause is structural.** `HumanInTheLoopMiddleware` interrupts the graph per tool — it does
+  not depend on the model choosing to comply with an instruction.
+- **Approval is the only write path.** No endpoint performs a write directly.
+- **The envelope carries no `reply` field**, so a client cannot render a queued write as done.
+- **Writes are idempotent** within a turn, keyed on `(correlation_id, tool, arguments)` and enforced
+  by a unique index — the database settles the race, not the application. A retry collapses onto the
+  first write; the same request made next week legitimately opens a second case.
+
+Contact updates are restricted by **allowlist** (`email`, `phone`, `city`), so a field added later
+is closed by default. Name and date of birth need a fresh KYC cycle, and there is no tool for them.
+
 ### The audit trail
 
 Every tool call the agent makes is appended to `tool_audit` — one immutable row, never updated,
@@ -126,7 +157,7 @@ trade for a servicing assistant; a system that moved money would fail closed ins
 ### Tests
 
 ```bash
-pytest -q      # 41 passing — no Docker, no API key
+pytest -q      # 57 passing — no Docker, no API key
 ```
 
 Data-access tests run against an in-memory Mongo (`mongomock-motor`) and agent tests drive a
@@ -159,8 +190,8 @@ tests, and `RETRO.md` for sprint retrospectives.
 - [x] **Phase 1** — domain model, Mongo collections, synthetic seed
 - [x] **Phase 2** — MCP server, 4 read tools
 - [x] **Phase 3** — agent loop, MCP→LangChain bridge, chat endpoint
-- [x] **Phase 4** — Mongo-backed conversation state + append-only tool audit *(41 tests passing)*
-- [ ] **Phase 5** — write tools + human-in-the-loop approval
+- [x] **Phase 4** — Mongo-backed conversation state + append-only tool audit
+- [x] **Phase 5** — write tools, idempotency, human-in-the-loop approval *(57 tests passing)*
 - [ ] **Phase 6** — 🎯 MVP cut: README, diagram, one-command demo
 - [ ] **Phase 7** — Kafka producer + worker, async document verification
 - [ ] **Phase 8** — idempotency, per-tool timeout + retry policy

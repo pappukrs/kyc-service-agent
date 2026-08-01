@@ -1,14 +1,15 @@
 """FastAPI entrypoint — request intake, session routing, health, metrics.
 
-Phase 0 gives you a working service with health + metrics. The chat and
-approval endpoints are stubbed with their contracts defined; fill them in at
-Phase 3 and Phase 5.
+Health, metrics, customer reads, the agent chat endpoint, the approval gate,
+and the audit-trail reconstruction endpoint.
+
 """
 
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
+from langgraph.types import Command
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 from starlette.responses import Response
@@ -162,6 +163,42 @@ async def session_audit(session_id: str) -> dict:
 
 @app.post("/sessions/{session_id}/approve", tags=["agent"])
 async def approve(session_id: str, body: ApprovalIn) -> dict:
-    """Approve or deny a pending write, then resume the agent."""
-    # TODO(Phase 5): resume the interrupted graph; record approver in tool_audit.
-    raise HTTPException(status_code=501, detail="Phase 5: approval flow not implemented yet")
+    """Approve or reject a pending write, then resume the agent.
+
+    Approving is the only path by which a write executes. There is no endpoint
+    that performs one directly, and the agent cannot bypass this — the pause is
+    structural, not an instruction the model is asked to respect.
+    """
+    config = {"configurable": {"thread_id": session_id}}
+    state = await app.state.agent.aget_state(config)
+
+    if not state.interrupts:
+        raise HTTPException(
+            status_code=409,
+            detail=f"No action is awaiting approval on session {session_id}.",
+        )
+
+    decision: dict[str, Any] = (
+        {"type": "approve"}
+        if body.approve
+        else {"type": "reject", "message": body.reason or "A reviewer declined this action."}
+    )
+    # The middleware reads resume["decisions"] — one decision per pending
+    # action request, in the order they were presented.
+    resume_payload = {"decisions": [decision] * len(state.interrupts[0].value["action_requests"])}
+
+    # Name the approver for the duration of the resumed run, so the audit row
+    # for the write records which human authorised it.
+    audit.set_approver(body.approver if body.approve else "")
+    try:
+        result = await app.state.agent.ainvoke(Command(resume=resume_payload), config)
+    finally:
+        # Always clear: an approver left set would attach this person's
+        # authorisation to some later, unapproved write.
+        audit.clear_approver()
+
+    return {
+        "status": "approved" if body.approve else "rejected",
+        "approver": body.approver,
+        "reply": result["messages"][-1].content,
+    }

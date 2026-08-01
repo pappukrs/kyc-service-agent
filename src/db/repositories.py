@@ -6,12 +6,16 @@ and the MCP tool bodies stay thin. The database handle is passed in rather than
 imported, which is what makes the tests below able to run against a fake Mongo.
 """
 
+import hashlib
+import json
 import re
+from datetime import UTC, datetime
 from typing import Any
 
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from pymongo.errors import DuplicateKeyError
 
-from src.domain.models import DocumentStatus, OnboardingStage
+from src.domain.models import CaseStatus, DocumentStatus, OnboardingStage
 
 # Statuses that stop a customer progressing, mapped to what the customer must do.
 _BLOCKING_STATUSES: dict[str, str] = {
@@ -132,3 +136,143 @@ async def search_kb(db: AsyncIOMotorDatabase, query: str, limit: int = 3) -> lis
 
     scored.sort(key=lambda pair: (-pair[0], pair[1]["title"]))
     return [article for _, article in scored[:limit]]
+
+
+# --------------------------------------------------------------------------- #
+# Writes
+# --------------------------------------------------------------------------- #
+
+# Fields a customer is allowed to change through servicing. Anything touching
+# identity (name, date of birth) requires a fresh KYC cycle and a human — an
+# allowlist rather than a denylist, so a new field is closed by default.
+UPDATABLE_CONTACT_FIELDS: frozenset[str] = frozenset({"email", "phone", "city"})
+
+
+def idempotency_key(scope: str, tool: str, arguments: dict[str, Any]) -> str:
+    """Derive a stable key for one logical write.
+
+    Same scope + same tool + same arguments ⇒ same key, so a retried or
+    duplicated call collapses onto the first one instead of creating a second
+    case. Scope is the correlation id: retrying *within a turn* is a duplicate,
+    but a customer legitimately asking again tomorrow is not.
+    """
+    canonical = json.dumps(arguments, sort_keys=True, default=str)
+    digest = hashlib.sha256(f"{scope}|{tool}|{canonical}".encode()).hexdigest()
+    return digest[:32]
+
+
+async def _claim_idempotency_key(
+    db: AsyncIOMotorDatabase, key: str, tool: str
+) -> dict[str, Any] | None:
+    """Claim a key, or return the result of the write that claimed it first.
+
+    Relies on the unique index on `idempotency_keys.key` — the database decides
+    the race, not the application. Returns None when the claim succeeded and
+    the caller should proceed.
+    """
+    try:
+        await db.idempotency_keys.insert_one(
+            {"key": key, "tool": tool, "created_at": datetime.now(UTC), "result": None}
+        )
+        return None
+    except DuplicateKeyError:
+        existing = await db.idempotency_keys.find_one({"key": key}, {"_id": 0})
+        return (existing or {}).get("result") or {"status": "duplicate_in_progress"}
+
+
+async def _store_idempotent_result(
+    db: AsyncIOMotorDatabase, key: str, result: dict[str, Any]
+) -> None:
+    await db.idempotency_keys.update_one({"key": key}, {"$set": {"result": result}})
+
+
+async def create_case(
+    db: AsyncIOMotorDatabase,
+    *,
+    customer_id: str,
+    category: str,
+    summary: str,
+    session_id: str | None = None,
+    approved_by: str | None = None,
+    scope: str = "",
+) -> dict[str, Any]:
+    """Open a servicing case. Idempotent within a correlation scope."""
+    if await find_customer(db, customer_id) is None:
+        return {"error": "customer_not_found", "customer_id": customer_id}
+
+    args = {"customer_id": customer_id, "category": category, "summary": summary}
+    key = idempotency_key(scope, "create_servicing_case", args)
+    if prior := await _claim_idempotency_key(db, key, "create_servicing_case"):
+        # Report the original outcome rather than silently doing nothing — the
+        # agent needs to tell the customer a case exists, not that it failed.
+        return prior | {"idempotent_replay": True}
+
+    case_id = f"CASE-{key[:8].upper()}"
+    case = {
+        "case_id": case_id,
+        "customer_id": customer_id,
+        "category": category,
+        "summary": summary,
+        "status": CaseStatus.OPEN.value,
+        "created_at": datetime.now(UTC),
+        "session_id": session_id,
+        "approved_by": approved_by,
+    }
+    await db.servicing_cases.insert_one(case)
+
+    result = {
+        "status": "created",
+        "case_id": case_id,
+        "customer_id": customer_id,
+        "case_status": CaseStatus.OPEN.value,
+        "approved_by": approved_by,
+    }
+    await _store_idempotent_result(db, key, result)
+    return result
+
+
+async def update_contact(
+    db: AsyncIOMotorDatabase,
+    *,
+    customer_id: str,
+    field: str,
+    value: str,
+    approved_by: str | None = None,
+    scope: str = "",
+) -> dict[str, Any]:
+    """Update one contact field. Idempotent within a correlation scope."""
+    if field not in UPDATABLE_CONTACT_FIELDS:
+        return {
+            "error": "field_not_updatable",
+            "field": field,
+            "message": (
+                f"{field!r} cannot be changed through servicing. Updatable fields are: "
+                f"{', '.join(sorted(UPDATABLE_CONTACT_FIELDS))}. Changes to name or date of "
+                f"birth require a fresh KYC cycle."
+            ),
+        }
+
+    if await find_customer(db, customer_id) is None:
+        return {"error": "customer_not_found", "customer_id": customer_id}
+
+    args = {"customer_id": customer_id, "field": field, "value": value}
+    key = idempotency_key(scope, "update_customer_contact", args)
+    if prior := await _claim_idempotency_key(db, key, "update_customer_contact"):
+        return prior | {"idempotent_replay": True}
+
+    await db.customers.update_one(
+        {"customer_id": customer_id},
+        {"$set": {field: value, "updated_at": datetime.now(UTC)}},
+    )
+
+    # Note: the new value is NOT echoed back. It is personal data, it is already
+    # known to whoever supplied it, and returning it would put it in the model's
+    # context and the conversation transcript for no benefit.
+    result = {
+        "status": "updated",
+        "customer_id": customer_id,
+        "field": field,
+        "approved_by": approved_by,
+    }
+    await _store_idempotent_result(db, key, result)
+    return result

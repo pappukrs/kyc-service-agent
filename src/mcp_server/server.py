@@ -21,6 +21,7 @@ Run standalone:  python -m src.mcp_server.server
 from mcp.server.mcpserver import MCPServer
 
 from src.db import mongo, repositories
+from src.obs import audit
 
 # MCP SDK 2.x: MCPServer replaces the 1.x `FastMCP` class. Same decorator
 # ergonomics — @mcp.tool() — but imported from mcp.server.mcpserver.
@@ -142,9 +143,17 @@ async def create_servicing_case(customer_id: str, category: str, summary: str) -
     requested, or they have asked to escalate. Do not open a case for questions
     you can answer from the read tools.
     """
-    # TODO(Phase 5): write to servicing_cases, guarded by an idempotency key,
-    # and only after the approval event has been recorded.
-    raise NotImplementedError("Phase 5")
+    return await repositories.create_case(
+        mongo.get_db(),
+        customer_id=customer_id,
+        category=category,
+        summary=summary,
+        approved_by=audit.get_approver(),
+        # Scoping idempotency to the correlation id means a retry *within this
+        # turn* collapses onto the first write, while the same request made
+        # again tomorrow legitimately opens a second case.
+        scope=audit.get_correlation_id(),
+    )
 
 
 @mcp.tool()
@@ -155,8 +164,14 @@ async def update_customer_contact(customer_id: str, field: str, value: str) -> d
     fields and has stated the new value. `field` must be one of: email, phone,
     city. Never infer a new value from context — ask for it.
     """
-    # TODO(Phase 5): validate field against an allowlist, then update + audit.
-    raise NotImplementedError("Phase 5")
+    return await repositories.update_contact(
+        mongo.get_db(),
+        customer_id=customer_id,
+        field=field,
+        value=value,
+        approved_by=audit.get_approver(),
+        scope=audit.get_correlation_id(),
+    )
 
 
 if __name__ == "__main__":

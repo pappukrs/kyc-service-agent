@@ -41,6 +41,12 @@ logger = logging.getLogger(__name__)
 # parameter so the tool layer stays unaware of the API layer.
 _correlation_id: ContextVar[str] = ContextVar("correlation_id", default="")
 
+# Who authorised the write currently executing. Set by the approval endpoint
+# just before it resumes a paused graph, so the audit row records *which human*
+# let the write through — the question an auditor actually asks. Empty for
+# reads, which need no approval.
+_approver: ContextVar[str] = ContextVar("approver", default="")
+
 # Argument names whose *values* are personal data. Matched as substrings so
 # `new_email`, `contact_phone`, and `value` are all covered.
 _SENSITIVE_ARG_HINTS: tuple[str, ...] = (
@@ -73,6 +79,24 @@ def get_correlation_id() -> str:
     still produces a well-formed audit row rather than an empty field.
     """
     return _correlation_id.get() or new_correlation_id()
+
+
+def set_approver(approver: str) -> None:
+    """Record who authorised the write about to execute."""
+    _approver.set(approver)
+
+
+def clear_approver() -> None:
+    """Drop the approver once the approved write has run.
+
+    Not housekeeping — an approver left set would attach one human's
+    authorisation to a later, unapproved write in the same context.
+    """
+    _approver.set("")
+
+
+def get_approver() -> str | None:
+    return _approver.get() or None
 
 
 def redact_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -118,8 +142,9 @@ async def record_tool_call(
         "latency_ms": latency_ms,
         "is_error": is_error,
         "error_message": error_message,
-        # Populated by the Phase 5 approval flow; None for reads.
-        "approved_by": approved_by,
+        # Set for approved writes, None for reads. Falls back to the ambient
+        # approver so the tool layer does not have to thread it through.
+        "approved_by": approved_by or get_approver(),
         "created_at": datetime.now(UTC),
     }
 
