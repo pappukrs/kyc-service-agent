@@ -1,239 +1,176 @@
-# Project Plan — Agentic Servicing Assistant
+# Build Plan & Status
 
-> **Why this project:** `README.md` §1 lists four hard gaps against the Wells Fargo JD — **Python**,
-> **Google ADK/LangChain**, **agentic environments**, and **MCP**. This one project closes all four,
-> plus reinforces MongoDB and Kafka, in a **banking-servicing domain that mirrors their exact
-> product**. It is also the highest-leverage thing you can build right now for the whole category:
-> every Bengaluru fintech is hiring for agentic platforms, and almost none of those applicants have
-> your KYC/onboarding background to pair with it.
->
-> **Build it, then paste the pre-written bullets from `resume-content.md` §APPENDIX.**
-> ⚠️ Nothing goes on the résumé until it exists and runs.
+Where the project is, what's left, and why the load-bearing decisions went the way they did.
+
+**Shipped:** Phases 0–5 · **57 tests passing** · no Docker or API key required to run them.
+The system is functionally complete end to end: a servicing request comes in, the agent reads real
+data through MCP, answers, and any write it wants to make pauses for a human.
 
 ---
 
-## 1. What you're building
+## Status at a glance
 
-**An AI-assisted customer-servicing assistant for retail banking onboarding and KYC.**
-
-A servicing request comes in — *"my KYC document was rejected, what now?"*, *"what's the status of my
-onboarding?"*, *"update my registered address"* — and an agent resolves it end to end: looks up the
-customer, reads their onboarding and KYC state, explains the blocker, and either answers or opens a
-servicing case. Write actions pause for human approval. Every tool call is audited.
-
-That is, deliberately, a plain-English restatement of the JD:
-
-| JD phrase | Where it lands in this project |
-|---|---|
-| "design and build an AI-Assisted servicing platform" | the whole thing |
-| "Design and Develop AI Agents using Google ADK/Langchain" | Phase 3 (LangChain/LangGraph) + Phase 11 (ADK port) |
-| "Implement production grade agents" | guardrails, audit trail, evals, observability |
-| "Build robust APIs and workflows" | FastAPI + the approval workflow |
-| "Implement workflow and task-based processing" | Kafka worker for async document verification |
-| "Strong MCP" | the MCP server is how the agent gets every tool |
-| "Strong MongoDB or any NoSQL" | conversation state, case records, audit log |
-| "Kafka/Queues, Workflows" | Phase 7 |
-| "Exposure to Banking domain (KYC, Onboarding)" | the domain model — and you have real SenseGrass experience behind it |
-| "Basic understanding of cloud-native concepts" | Docker Compose, health checks, 12-factor config |
-| "Hands-on experience working in Agile" | §6 — run it as two real sprints |
-
-⚠️ **Synthetic data only.** Seed fake customers and fake documents. Never put real banking data,
-real PII, or anything from Chesa into this repo. Say "synthetic dataset" in the README and in
-interviews — a candidate who is careless with data is a non-starter at a bank.
+| # | Phase | State | What it delivered |
+|---|---|---|---|
+| 0 | Skeleton | ✅ | Compose (Mongo + Kafka), 12-factor config, `/healthz`, `/metrics`, Makefile |
+| 1 | Domain + seed | ✅ | Pydantic models, Mongo collections + indexes, 50 synthetic customers with correlated document states |
+| 2 | MCP server | ✅ | 7 tools declared, 4 read tools implemented, prescriptive descriptions |
+| 3 | Agent loop | ✅ | LangGraph agent, MCP→LangChain bridge, system prompt, chat endpoint |
+| 4 | State + audit | ✅ | Mongo checkpointer, append-only `tool_audit`, `GET /sessions/{id}/audit` |
+| 5 | Write gate | ✅ | Both write tools, idempotency, `POST /sessions/{id}/approve` |
+| 6 | Presentation | ▫️ | Architecture diagram, demo script, deploy |
+| 7 | Async work | ▫️ | Kafka producer + worker, `verify_kyc_document` |
+| 8 | Resilience | ▫️ | Per-tool timeout + retry policy |
+| 9 | Evals | ▫️ | 15-scenario suite, 4 assertion types, in CI |
+| 10 | Observability | ▫️ | Structured logs, PII redaction, Prometheus metrics, token/cost counters |
+| 11 | ADK port | ▫️ | Google ADK runtime behind the same MCP tools |
 
 ---
 
-## 2. Architecture
+## Shipped, in detail
 
-```
-                    ┌──────────────────────────────────────────┐
-   HTTP  ─────────▶ │  FastAPI  —  auth (JWT), request intake,  │
-                    │  session routing, /healthz, /metrics      │
-                    └────────────────────┬─────────────────────┘
-                                         │
-                    ┌────────────────────▼─────────────────────┐
-                    │  Agent service  —  LangGraph agent loop   │
-                    │  plan → call tool → observe → repeat      │
-                    │  interrupt() on any write action          │
-                    └────────────────────┬─────────────────────┘
-                                         │ tools loaded over MCP
-                    ┌────────────────────▼─────────────────────┐
-                    │  MCP server  —  the ONLY way the agent    │
-                    │  touches banking data. 7 typed tools.     │
-                    └───────┬───────────────────────┬──────────┘
-                            │                       │
-              ┌─────────────▼──────────┐   ┌────────▼─────────────┐
-              │  MongoDB               │   │  Kafka               │
-              │  • customers           │   │  • servicing.tasks   │
-              │  • kyc_documents       │   │  • servicing.audit   │
-              │  • servicing_cases     │   └────────┬─────────────┘
-              │  • conversations       │            │
-              │  • tool_audit (append) │   ┌────────▼─────────────┐
-              │  • idempotency_keys    │   │  Worker — async doc  │
-              └────────────────────────┘   │  verification, then  │
-                                           │  updates the case    │
-                                           └──────────────────────┘
-```
+### Phase 0 — Skeleton
+Docker Compose brings up MongoDB and Kafka (KRaft mode, no ZooKeeper). Config is 12-factor via
+`pydantic-settings`; nothing in the codebase hard-codes a connection string or provider name.
+`/healthz` reports Mongo reachability, `/metrics` serves Prometheus.
 
-**The one design decision to lead with in interviews:** *the agent has no direct database access.*
-Every capability is a typed MCP tool with an explicit contract. That's what makes the audit trail
-complete, the permission model enforceable, and the tool surface swappable between LangChain and ADK
-without touching business logic.
+### Phase 1 — Domain and synthetic data
+Six collections: `customers`, `kyc_documents`, `servicing_cases`, `conversations`, `tool_audit`,
+`idempotency_keys`. `scripts/seed.py` generates 50 customers whose document states correlate with
+their onboarding stage — an approved customer has verified documents, a blocked one has a rejection
+with a reason. The seed is deterministic (`random.seed(42)`) so eval scenarios can reference
+specific customer ids.
 
-### Stack
+### Phase 2 — MCP server
+All seven tools declared; the four read tools implemented. `get_onboarding_status` derives blockers
+from stage plus document state and, importantly, distinguishes documents the customer must **act
+on** (rejected, expired) from ones they are merely **waiting for** (pending, verifying).
 
-| Layer | Choice | Why |
-|---|---|---|
-| Language | **Python 3.12** | the gap you're closing |
-| API | **FastAPI** + Pydantic | async, typed, the Python default |
-| Agent | **LangGraph** (LangChain) | you need state + human-in-the-loop; LangGraph has `interrupt`/resume built in |
-| Tools | **MCP** (`mcp` Python SDK, `FastMCP`) | the JD's "Strong MCP" — and it's an open standard, not vendor lock-in |
-| Bridge | **`langchain-mcp-adapters`** | loads MCP tools straight into a LangChain/LangGraph agent |
-| Store | **MongoDB** (Motor async driver) | reinforces a ✅ you already have |
-| Queue | **Kafka** (`aiokafka`) — RabbitMQ acceptable | JD says "Kafka/Queues"; you know RabbitMQ, so Kafka is the new bit |
-| Runtime | **Docker Compose** | whole stack up with one command |
+`search_servicing_kb` is lexical term-overlap scoring with tags weighted above body text —
+deliberately not a vector store. A few dozen policy articles do not need embeddings, and a lexical
+matcher is far easier to reason about when an eval fails.
 
-**On the model provider:** LangChain and LangGraph are provider-agnostic — keep the model behind one
-config value (`MODEL_PROVIDER` / `MODEL_NAME`) and a single factory function. Use whatever you have
-credits for during development; a smaller/cheaper model is fine for everything except the final demo
-run. Google ADK is Google's own framework and defaults to Gemini, which is what the Phase 11 port
-will use. **Do not hard-code a provider anywhere but that factory** — being able to say *"the model
-is one config line, because the agent only ever talks to tools"* is itself a good architecture
-answer.
+### Phase 3 — Agent loop
+`agent_session()` is an async context manager, because the tools close over a live MCP client and
+the agent is only valid while that session is open. `read_only=True` binds just the four read tools
+— an agent never given a write tool cannot be prompted into calling one.
+
+The system prompt lives in its own module (`src/agent/prompt.py`) because it is behaviour, not
+configuration: it changes what the agent does at least as much as the code does, so it should be
+reviewed and diffed like code. Its first and longest section is grounding — every factual claim
+about a customer must come from a tool result in the conversation.
+
+### Phase 4 — Conversation state and audit
+`MongoDBSaver` persists graph state per thread. This is load-bearing rather than a nicety: a write
+parked for human approval must survive the process that parked it, or a restart drops every pending
+decision. Tested by resuming a paused write with a brand-new agent instance against the same store.
+
+The audit trail is appended at the MCP→LangChain bridge — the single choke point every tool call
+passes through, successes and failures alike.
+
+### Phase 5 — Write gate
+Both write tools implemented, idempotent within a correlation scope. `POST /sessions/{id}/approve`
+resumes or rejects a paused run; approving with nothing pending is a 409 rather than a silent no-op.
 
 ---
 
-## 3. The tool surface (design this before you write code)
+## Remaining
 
-Seven tools, split by blast radius. **The read/write split is the security boundary** — say it that
-way in interviews.
+### Phase 6 — Presentation
+Architecture diagram (rendered, not ASCII), a demo script someone can follow in five minutes,
+deploy to Cloud Run or EC2. Nothing new functionally — this is the phase that makes the work legible
+to someone who won't read the source.
 
-| Tool | Kind | Contract |
-|---|---|---|
-| `get_customer` | read | `customer_id` → profile, onboarding stage, risk tier |
-| `get_onboarding_status` | read | `customer_id` → stage, blockers, pending items |
-| `list_kyc_documents` | read | `customer_id` → docs with status + rejection reason |
-| `search_servicing_kb` | read | `query` → policy/FAQ snippets (plain keyword search is fine — this is not a RAG project) |
-| `verify_kyc_document` | **async** | `document_id` → enqueues a Kafka task, returns `{status: "queued", task_id}` |
-| `create_servicing_case` | **write ⚠️** | `customer_id, category, summary` → needs human approval |
-| `update_customer_contact` | **write ⚠️** | `customer_id, field, value` → needs human approval |
+### Phase 7 — Async document verification
+`verify_kyc_document` currently raises. It should produce to `servicing.tasks` and return
+`{"status": "queued", "task_id": ...}` immediately; the worker consumes, simulates verification
+latency and a pass/fail outcome, updates the document and any linked case, and emits to
+`servicing.audit`.
 
-**Write prescriptive tool descriptions.** The single highest-leverage prompt-engineering lever in an
-agentic system is that each tool's own description says **when to call it**, not just what it does:
+The behavioural risk worth testing here: the agent must tell the customer verification is **in
+progress**, never that it succeeded. The tool description already says so; Phase 9 should assert it.
 
-```python
-@mcp.tool()
-async def list_kyc_documents(customer_id: str) -> list[dict]:
-    """List a customer's KYC documents with status and rejection reasons.
+### Phase 8 — Resilience
+Per-tool timeout and retry policy. Today a slow tool blocks the turn indefinitely. Tool errors
+already return as data (`TOOL_ERROR from …`) rather than raising, so the agent can recover — but
+there is no bound on how long it waits first.
 
-    Call this whenever the customer asks why their onboarding is blocked, why a
-    document was rejected, or what they still need to submit. Prefer this over
-    get_onboarding_status when the question is specifically about documents.
-    """
-```
+### Phase 9 — Evaluation suite
+`evals/scenarios.yaml` has 5 of a planned 15 scenarios and no runner. Four assertion types:
 
-**There is deliberately no money-movement tool.** No transfers, no payments, no balance mutation.
-Say so out loud in the README and the interview — *"an agent that can move money is a different
-risk conversation; the scope here is servicing, and the tool surface enforces that."* That single
-sentence signals more banking maturity than any feature you could add.
+- **tool selection** — was the right tool called? catches over- and under-calling
+- **no unapproved writes** — asserted against `tool_audit`, not the transcript; the transcript is
+  what the model *said*, the audit log is what actually happened
+- **grounded** — every factual claim traces to a tool result
+- **refusal** — out-of-scope requests declined rather than hallucinating a capability
 
----
+This is the phase that tests *judgement* rather than wiring, and it needs a real model. The existing
+57 tests deliberately cover only mechanics; conflating the two would make both weaker.
 
-## 4. Build plan — 12 days, ~3 h/day
+### Phase 10 — Observability
+Structured JSON logs carrying the correlation id, PII redaction at the log boundary, Prometheus
+counters and histograms per tool, token and cost accounting. `langchain.agents.middleware` ships a
+`PIIMiddleware` worth evaluating before hand-rolling redaction.
 
-Each phase has an **acceptance test**. Don't move on until it passes.
-**Day 6 is an MVP cut** — if you run out of time, stop there and you still have a shippable,
-résumé-able project that closes Python + LangChain + MCP + agentic. Everything after Day 6 is upside.
-
-### Week 1 — the spine
-
-| Day | Build | Acceptance test |
-|---|---|---|
-| **0** | Repo, Python 3.12, `uv`/Poetry, Docker Compose (Mongo + Kafka), `.env.example`, `/healthz` | `docker compose up` → `curl /healthz` returns 200 |
-| **1** | Domain model (Pydantic), Mongo collections, `seed.py` generating ~50 synthetic customers with varied onboarding states | `GET /customers/{id}` returns a seeded customer; a rejected-KYC customer exists |
-| **2** | **MCP server** with the 4 read tools, stdio transport, prescriptive descriptions | MCP Inspector lists all 4 and calls `list_kyc_documents` successfully |
-| **3** | **LangGraph agent** + `langchain-mcp-adapters`; chat endpoint `POST /sessions/{id}/messages` | *"Why is CUST-014 blocked?"* → agent calls 2 tools and answers correctly from the data |
-| **4** | Conversation state + **append-only `tool_audit`** collection (one doc per call: tool, args, result hash, latency, correlation id) | Restart the process, resume `session_id`, context intact; audit count matches tool calls |
-| **5** | Write tools + **human-in-the-loop approval** via LangGraph `interrupt` → `POST /sessions/{id}/approve` | `create_servicing_case` pauses; approve → case created; deny → no write, agent explains |
-| **6** | 🎯 **MVP CUT** — README, architecture diagram, one-command startup, demo script | A stranger clones the repo and gets a working demo in under 5 minutes |
-
-### Week 2 — what makes it "production grade"
-
-| Day | Build | Acceptance test |
-|---|---|---|
-| **7** | **Kafka** producer + worker; `verify_kyc_document` enqueues, worker processes and updates the case | Tool returns `queued`; worker logs consumption; case reflects the result |
-| **8** | **Idempotency** keys on writes, per-tool **timeout + retry policy**, structured error results the agent can recover from | Replaying the same write twice creates one case; a forced tool timeout produces a graceful agent response, not a crash |
-| **9** | **Eval harness** — 15 scenarios in YAML, run under pytest | All 15 pass; assertions in §5 below |
-| **10** | **Observability** — JSON logs with correlation id, PII redaction, Prometheus counters/histograms, `/metrics`, token+cost counter | `/metrics` shows per-tool call counts and latency; no raw PII in any log line |
-| **11** | **Google ADK port** of the agent layer, same MCP tools, selected by config | Both runtimes pass the same eval suite |
-| **12** | Architecture diagram, README rewrite, 3-minute demo video, deploy (Cloud Run / EC2), pin the repo | Public URL or video link in the README; repo pinned on your GitHub profile |
-
-**Day 11 matters more than it looks.** The JD says "Google ADK**/**Langchain". Having both behind one
-tool layer lets you say: *"the tools are MCP, so the agent framework is swappable — I ran the same
-eval suite against a LangGraph agent and a Google ADK agent."* That is a senior-sounding sentence
-backed by a real artifact, and it converts a 🔴 gap into a strength.
+### Phase 11 — Google ADK port
+A second runtime binding the same MCP tools, selected by `AGENT_RUNTIME`. The point is to
+demonstrate that the tool surface — not the framework — is the stable interface: both runtimes
+should pass the same eval suite unchanged.
 
 ---
 
-## 5. The eval harness (Day 9) — this is your differentiator
+## Decision log
 
-Most "I built an agent" projects have no tests. Fifteen scenarios and four assertion types put you
-in a different bracket:
+Things that could reasonably have gone the other way.
 
-1. **Tool selection** — for this question, was the right tool called? (Catches over- and under-calling.)
-2. **No unapproved writes** — no write tool ever executes without an approval event. Assert on the audit log, not the transcript.
-3. **Grounding** — every factual claim about a customer traces to a tool result. Reject answers that invent an account number or a status.
-4. **Refusal** — out-of-scope requests ("transfer ₹50,000") are declined and explained. There is no such tool; the agent must handle that gracefully rather than hallucinate one.
+**The agent has no direct database access.** Every capability is a typed MCP tool. This is what
+makes the audit trail complete (one choke point), the permission model enforceable (the gate lives
+at the tool boundary), and the runtime swappable (Phase 11 changes nothing below the tools).
 
-Run it in CI. You already know how to gate deploys on tests — that's a ✅ from `Knowledgebase.md` §12,
-so reuse the GitHub Actions pattern from `expense-portal`.
+**No money-movement tool exists.** Not disabled — absent. No transfers, no payments, no balance
+reads. An agent that can move money is a different risk conversation; the scope here is servicing,
+and the tool surface enforces that rather than relying on the prompt to.
 
----
+**Approval is per tool, not per graph node.** The graph-level `interrupt_before` takes *node* names,
+and every tool shares one node — using it would have gated reads too. `HumanInTheLoopMiddleware`
+discriminates by tool name.
 
-## 6. Run it as two Agile sprints (free credibility)
+**Idempotency is scoped to the correlation id.** A retry within one turn collapses onto the first
+write; the same request made next week legitimately opens a second case. Keyed on
+`(correlation_id, tool, arguments)` and enforced by a unique index, so the database settles the race
+rather than the application.
 
-The JD lists Agile as a separate requirement with three sub-bullets: **estimation, sprint planning,
-reviews and retrospectives**. Don't just claim it — do it, in the repo:
+**Audit rows hash results and redact argument values.** Results carry PII, so the log stores a
+SHA-256 rather than a second copy of the customer database. The subtler half:
+`update_customer_contact(field="email", value=...)` carries personal data *in its arguments*, so
+hashing the result while logging raw args would leak precisely the field the write was about.
 
-- **Sprint 1 = Days 0–6**, **Sprint 2 = Days 7–12.**
-- A GitHub Projects board with estimated issues (story points or hours) — estimate *before* you start.
-- At each sprint end write a 5-line `RETRO.md`: what shipped, what slipped, estimate vs. actual, one change for next sprint.
+**An audit write failing does not fail the request.** It is logged and swallowed. A deliberate trade
+for a servicing assistant — losing one audit row beats failing a customer's turn. A system that
+moved money would make the opposite call and fail closed.
 
-Cost: about 30 minutes total. It makes "I estimate work and run sprint ceremonies" a thing you can
-show rather than assert, and estimate-vs-actual is exactly the sort of concrete answer interviewers
-remember.
+**Contact updates are an allowlist, not a denylist.** `email`, `phone`, `city`. A field added to the
+model later is closed by default rather than silently writable.
 
----
-
-## 7. When you're done — updating the résumé
-
-1. Open `resume-content.md` §APPENDIX — the skills lines and project entry are pre-written with
-   `[[ slots ]]`.
-2. **Verify each line is literally true of what you built.** Delete anything you didn't do.
-   Especially: don't claim Kafka if you used RabbitMQ, and don't claim an ADK port you skipped.
-3. Fill the slots, move the block into the main résumé body, re-export the PDF from the HTML.
-4. Update `cover-letter.md` — the `[[ Optional, only once true ]]` clause about building agentic
-   services in Python becomes true; unbracket it. That single clause changes the letter's whole pitch.
-5. Re-apply to Wells Fargo **and** to every other agentic-platform JD in the category.
+**No `langchain-mcp-adapters`.** Its latest release (0.3.1) imports `mcp.server.fastmcp.tools`, a
+module removed in MCP SDK 2.0, so it cannot be imported against a current SDK — and pip does not
+catch it because its `mcp` dependency is unpinned. The choice was to pin this project to a
+superseded SDK or own ~50 lines of glue; `src/agent/mcp_tools.py` is the glue.
 
 ---
 
-## 8. Interview questions this project earns you — prepare answers
+## Known gaps
 
-You will be asked these. Have the answer ready before you apply.
+Being explicit about what has **not** been demonstrated, as distinct from what is unimplemented.
 
-- **"Why MCP instead of just wiring functions into the agent?"** — a typed tool contract the agent can't bypass, one audit point, and the framework becomes swappable (which you proved with the ADK port).
-- **"How do you stop the agent doing something destructive?"** — read/write split at the tool boundary; writes are `interrupt`-gated on human approval; there is no money-movement tool at all; every call is in an append-only audit log with a correlation id.
-- **"What happens when a tool fails or times out?"** — per-tool timeout and retry policy, structured error result fed back to the agent so it can recover or escalate, idempotency keys so a retried write doesn't double-create.
-- **"How do you know the agent works?"** — 15-scenario eval suite, four assertion types, running in CI. Then explain the grounding assertion — it's the one that shows you understand hallucination as an engineering problem, not a vibe.
-- **"How would you scale it?"** — stateless API and agent services behind a load balancer; Kafka consumer groups for the workers; Mongo indexes on `customer_id` and `session_id`; the real ceiling is model latency and rate limits, so cache read-tool results and batch where possible.
-- **"What would you do differently?"** — have a real answer. Candidates who can critique their own design read as senior; candidates who say "nothing" read as junior.
-
----
-
-## 9. Related
-
-- [`README.md`](./README.md) — the Wells Fargo JD gap analysis this project exists to close
-- [`resume-content.md`](./resume-content.md) §APPENDIX — the bullets to paste once it's built
-- [`cover-letter.md`](./cover-letter.md) §3 — the *"do you have Python and LangChain?"* answer, which this project rewrites
-- [`../Knowledgebase.md`](../Knowledgebase.md) §12 — "GitHub showcase: turn a project into a documented, deployed showcase with an architecture diagram" was already on your backlog. This is that item.
+- **Nothing has run against real MongoDB or a real model.** The suite runs against
+  `mongomock-motor` and a scripted fake chat model. Query shapes are ordinary and the unique index
+  idempotency depends on is honoured by mongomock, but the `MongoDBSaver` path specifically has not
+  been exercised against a live server.
+- **No test covers model judgement.** By design — see Phase 9.
+- **`verify_kyc_document` raises.** Declared and described, implemented in Phase 7.
+- **No authentication.** `JWT_SECRET` is in config and unused; every endpoint is open. Fine for a
+  local demo, not for anything else.
+- **The approver is whoever the caller says it is.** `POST /approve` takes an `approver` string on
+  trust. A real deployment needs that bound to an authenticated identity — an audit trail is only
+  as good as the identity feeding it.
