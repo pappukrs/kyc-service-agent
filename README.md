@@ -73,7 +73,7 @@ tool surface enforces that rather than relying on the prompt.
 
 ## Stack
 
-Python 3.12 · FastAPI · LangGraph (LangChain) · MCP (`FastMCP` + `langchain-mcp-adapters`) ·
+Python 3.12 · FastAPI · LangGraph (LangChain) · MCP SDK 2.x (`MCPServer`) ·
 MongoDB (Motor) · Kafka (aiokafka) · Prometheus · Docker Compose
 
 The model provider sits behind a single factory in `src/agent/llm.py` and one config value — the
@@ -99,7 +99,7 @@ make mcp                                        # or: python -m src.mcp_server.s
 npx @modelcontextprotocol/inspector python -m src.mcp_server.server
 ```
 
-All seven tools are registered; the four read tools are implemented. `list_kyc_documents`
+Six of the seven tools are implemented (`verify_kyc_document` lands in Phase 7). `list_kyc_documents`
 against a customer with a rejected document returns the rejection reason verbatim — that string
 is usually the whole answer to *"why am I blocked?"*.
 
