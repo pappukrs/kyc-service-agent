@@ -22,6 +22,7 @@ from mcp.server.mcpserver import MCPServer
 
 from src.db import mongo, repositories
 from src.obs import audit
+from src.worker import verification
 
 # MCP SDK 2.x: MCPServer replaces the 1.x `FastMCP` class. Same decorator
 # ergonomics — @mcp.tool() — but imported from mcp.server.mcpserver.
@@ -124,9 +125,16 @@ async def verify_kyc_document(document_id: str) -> dict:
     Verification is asynchronous: this returns {"status": "queued"} and the
     result lands on the case later. Tell the customer it is in progress — do
     not claim it has been verified.
+
+    `document_id` must come from list_kyc_documents. Never construct one.
     """
-    # TODO(Phase 7): produce to KAFKA_TASKS_TOPIC, return the task_id.
-    raise NotImplementedError("Phase 7")
+    return await verification.queue_verification(
+        mongo.get_db(),
+        document_id=document_id,
+        # Same idempotency scope as the write tools: asking twice in one turn
+        # queues one task; asking again next week legitimately queues another.
+        scope=audit.get_correlation_id(),
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -39,6 +39,7 @@ flowchart TB
     mongo[("MongoDB<br/>customers · kyc_documents<br/>servicing_cases · conversations<br/>tool_audit · idempotency_keys")]
     kafka[["Kafka<br/>servicing.tasks"]]
     worker["Worker — async<br/>document verification"]
+    events[["Kafka<br/>servicing.audit"]]
 
     client --> intake & approve & trail
     intake --> loop
@@ -51,6 +52,7 @@ flowchart TB
     reads & writes --> repos
     repos --> mongo
     async_tool --> kafka --> worker --> mongo
+    worker -.->|"what the system then did"| events
     loop -.->|"every call, append-only"| mongo
     trail --> mongo
 
@@ -117,7 +119,58 @@ Four properties make this a gate rather than a suggestion:
 
 ---
 
-## 3. What one turn writes to the audit trail
+## 3. The async path — a re-check that outlives the turn
+
+The write gate above is about a turn that must *stop*. This is the opposite problem: work that
+cannot finish inside a turn at all. `verify_kyc_document` queues and returns; the answer to the
+customer is composed before the work has run.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant G as LangGraph agent
+    participant M as MCP server
+    participant DB as MongoDB
+    participant K as Kafka
+    participant W as Worker
+
+    C->>G: "my address proof was rejected unfairly — recheck it"
+    G->>M: verify_kyc_document(DOC-014-1)
+    M->>DB: claim idempotency key (correlation_id, tool, args)
+    M->>K: produce VerificationTask to servicing.tasks
+    Note over M,K: send_and_wait — the claim "it is queued"<br/>is only made once it is true
+    M->>DB: document → verifying (previous_status kept)
+    M-->>G: {status: "queued", task_id: VER-…}
+    G-->>C: "It is being re-checked" — never "it passed"
+
+    Note over C,W: the turn is over; the work is not
+
+    K->>W: deliver (at-least-once)
+    W->>DB: already completed for this task_id? → drop
+    W->>W: verify (simulated, deterministic on document_id)
+    W->>DB: document → verified / rejected, stale reason cleared
+    W->>DB: append the outcome to any live servicing case
+    W->>K: emit kyc_document_verified to servicing.audit
+```
+
+| Property | Why it holds |
+|---|---|
+| The agent **cannot** claim success | The tool has no success to return. It reports `queued` and a status of `verifying`; the outcome is decided by the worker, in another process, after the turn has ended. |
+| The customer sees progress **immediately** | The enqueue moves the document to `verifying`, which the read tools already render as "in progress — no action needed". A customer asking again two minutes later is not told it is still rejected. |
+| Redelivery is **expected, not exceptional** | Kafka is at-least-once and the consumer commits *after* handling. The handler drops a task whose `task_id` is already recorded complete, so a replay cannot append a second note to a case or emit a second audit event. |
+| A broker outage **changes nothing** | The idempotency claim is released, the document is left alone, and the tool returns `verification_unavailable` with instructions to say so. A failed queue that reported success would be the worst outcome available here. |
+| The trail **crosses the process boundary** | The correlation id travels in the task, so the `servicing.audit` event ties back to the `tool_audit` row from the turn that requested it — what the agent asked for and what the system then did, joinable. |
+
+The one thing this does *not* do is gate on approval. Re-verification is not on the write path:
+the agent is asking the verification system to look again, and does not get to choose what it
+finds. What it can change — a document's status — it changes by requesting a decision, not by
+asserting one. A tool that let the agent *set* a document to verified would be a write, and would
+go through the gate.
+
+---
+
+## 4. What one turn writes to the audit trail
 
 ```mermaid
 flowchart LR
@@ -147,7 +200,7 @@ deliberate trade for a servicing assistant; a system that moved money would fail
 
 ---
 
-## 4. Why MCP, and not just functions bound to the agent
+## 5. Why MCP, and not just functions bound to the agent
 
 Binding Python functions straight into the agent is fewer moving parts, and for a single-framework
 prototype it would be the right call. The MCP indirection buys three things that matter here:

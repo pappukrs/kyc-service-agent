@@ -2,9 +2,10 @@
 
 Where the project is, what's left, and why the load-bearing decisions went the way they did.
 
-**Shipped:** Phases 0–5 · **57 tests passing** · no Docker or API key required to run them.
+**Shipped:** Phases 0–7 · **88 tests passing** · no Docker, broker or API key required to run them.
 The system is functionally complete end to end: a servicing request comes in, the agent reads real
-data through MCP, answers, and any write it wants to make pauses for a human.
+data through MCP, answers, any write it wants to make pauses for a human, and work too slow for a
+turn goes on a queue and lands back on the customer's record later.
 
 ---
 
@@ -18,8 +19,8 @@ data through MCP, answers, and any write it wants to make pauses for a human.
 | 3 | Agent loop | ✅ | LangGraph agent, MCP→LangChain bridge, system prompt, chat endpoint |
 | 4 | State + audit | ✅ | Mongo checkpointer, append-only `tool_audit`, `GET /sessions/{id}/audit` |
 | 5 | Write gate | ✅ | Both write tools, idempotency, `POST /sessions/{id}/approve` |
-| 6 | Presentation | ▫️ | Architecture diagram, demo script, deploy |
-| 7 | Async work | ▫️ | Kafka producer + worker, `verify_kyc_document` |
+| 6 | Presentation | ✅ | Rendered diagrams, `make demo`, tested end-to-end walkthrough |
+| 7 | Async work | ✅ | Kafka producer + worker, `verify_kyc_document`, at-least-once handling |
 | 8 | Resilience | ▫️ | Per-tool timeout + retry policy |
 | 9 | Evals | ▫️ | 15-scenario suite, 4 assertion types, in CI |
 | 10 | Observability | ▫️ | Structured logs, PII redaction, Prometheus metrics, token/cost counters |
@@ -88,18 +89,38 @@ unconditionally proves nothing, and one nobody runs until interview day has quie
 Deploying a public URL was originally scoped here; it moved to Phase 12 alongside the demo video,
 since neither changes the system and both are better done once it is finished.
 
+### Phase 7 — Async document verification
+`verify_kyc_document` produces a `VerificationTask` to `servicing.tasks` and returns
+`{"status": "queued", "task_id": ...}` without waiting. The worker consumes, simulates the check,
+writes the outcome to the document, appends it to any live case, and emits `kyc_document_verified`
+to `servicing.audit`.
+
+The behavioural risk this phase carries is one sentence — the agent must say verification is **in
+progress**, never that it succeeded — so the design removes the opportunity rather than
+instructing against it. The tool has no success to return: the outcome is decided in another
+process, after the turn has ended.
+
+Both halves live in `src/worker/verification.py`, and neither knows about Kafka — they take a
+publisher and a database. That is what makes the whole feature testable without a broker
+(25 of the 88 tests), and `consumer.py` is then nothing but a loop.
+
+Three things the queue forced that the synchronous path never had to think about:
+
+- **The document moves to `verifying` at enqueue.** Otherwise a customer asking again two minutes
+  later is told their document is still rejected, with nothing to show a re-check is running. It
+  also means the *submitted* status has been overwritten by the time the worker decides, so it is
+  preserved as `verification.previous_status` — an expired document must stay expired however many
+  times it is re-checked.
+- **Redelivery is expected, not exceptional.** At-least-once delivery plus a commit after handling
+  means the handler will see the same task twice, so it drops one already recorded complete. Without
+  that, a replay appends a second note to the customer's case and emits a second audit event.
+- **A broker outage must not be reported as success.** The idempotency claim is released, the
+  document is untouched, and the tool returns `verification_unavailable` with instructions to say
+  so. A queued-but-lost verification the customer has been told about is the worst outcome here.
+
 ---
 
 ## Remaining
-
-### Phase 7 — Async document verification
-`verify_kyc_document` currently raises. It should produce to `servicing.tasks` and return
-`{"status": "queued", "task_id": ...}` immediately; the worker consumes, simulates verification
-latency and a pass/fail outcome, updates the document and any linked case, and emits to
-`servicing.audit`.
-
-The behavioural risk worth testing here: the agent must tell the customer verification is **in
-progress**, never that it succeeded. The tool description already says so; Phase 9 should assert it.
 
 ### Phase 8 — Resilience
 Per-tool timeout and retry policy. Today a slow tool blocks the turn indefinitely. Tool errors
@@ -116,7 +137,9 @@ there is no bound on how long it waits first.
 - **refusal** — out-of-scope requests declined rather than hallucinating a capability
 
 This is the phase that tests *judgement* rather than wiring, and it needs a real model. The existing
-63 tests deliberately cover only mechanics; conflating the two would make both weaker.
+88 tests deliberately cover only mechanics; conflating the two would make both weaker. Phase 7 added
+the scenario this suite most needs: a re-check that has been *requested* must never be described as
+one that *passed*.
 
 ### Phase 10 — Observability
 Structured JSON logs carrying the correlation id, PII redaction at the log boundary, Prometheus
@@ -160,6 +183,23 @@ hashing the result while logging raw args would leak precisely the field the wri
 for a servicing assistant — losing one audit row beats failing a customer's turn. A system that
 moved money would make the opposite call and fail closed.
 
+**Re-verification is not behind the approval gate.** It changes a document's status, so the case
+for gating it is real. It is not gated because the agent is asking the verification system to look
+again and does not get to choose what it finds — the outcome is produced by another process on the
+document's own merits. Approval exists to put a human between the agent's *judgement* and the
+customer's record; here the agent exercises none. A tool that let it *set* a document to verified
+would be a write and would go through the gate.
+
+**The enqueue preserves the status it overwrites.** Moving the document to `verifying` is what makes
+progress visible to the read tools, but it destroys the very field the worker needs to decide —
+`verification.previous_status` carries it across. Without it an expired document quietly becomes
+verifiable, which is the one outcome re-verification must never produce.
+
+**The worker's audit trail is a Kafka topic, not a Mongo collection.** `tool_audit` records that the
+agent *asked* for verification; `servicing.audit` records what the system then *did*, in another
+process, after the turn ended. Both carry the correlation id, so the two halves join. Writing the
+async half into `tool_audit` would have made "every row is a tool call the agent made" false.
+
 **Contact updates are an allowlist, not a denylist.** `email`, `phone`, `city`. A field added to the
 model later is closed by default rather than silently writable.
 
@@ -179,7 +219,10 @@ Being explicit about what has **not** been demonstrated, as distinct from what i
   idempotency depends on is honoured by mongomock, but the `MongoDBSaver` path specifically has not
   been exercised against a live server.
 - **No test covers model judgement.** By design — see Phase 9.
-- **`verify_kyc_document` raises.** Declared and described, implemented in Phase 7.
+- **Nothing has run against a real Kafka broker.** The verification feature is tested end to end
+  against an in-memory publisher — the enqueue, the outcomes, redelivery, case updates and the
+  audit event. What that does not exercise is aiokafka itself: `consumer.py`'s loop, the manual
+  commit, and the group rebalance are unproven outside a live broker.
 - **No authentication.** `JWT_SECRET` is in config and unused; every endpoint is open. Fine for a
   local demo, not for anything else.
 - **The approver is whoever the caller says it is.** `POST /approve` takes an `approver` string on

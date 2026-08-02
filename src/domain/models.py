@@ -50,6 +50,14 @@ class CaseStatus(StrEnum):
     RESOLVED = "resolved"
 
 
+class VerificationOutcome(StrEnum):
+    """What the verification worker decided. A strict subset of DocumentStatus —
+    re-verification can only ever land a document in one of these two states."""
+
+    VERIFIED = "verified"
+    REJECTED = "rejected"
+
+
 class Customer(BaseModel):
     customer_id: str
     full_name: str
@@ -62,6 +70,23 @@ class Customer(BaseModel):
     updated_at: datetime
 
 
+class DocumentVerification(BaseModel):
+    """State of the most recent re-verification request for a document.
+
+    `completed_at` is what makes redelivery safe: Kafka is at-least-once, so the
+    worker can see the same task twice and needs a way to tell "not started yet"
+    from "already done".
+    """
+
+    task_id: str
+    queued_at: datetime
+    # The status `verifying` replaced — the worker needs it to decide, since an
+    # expired document stays expired however often it is re-checked.
+    previous_status: DocumentStatus | None = None
+    completed_at: datetime | None = None
+    outcome: VerificationOutcome | None = None
+
+
 class KycDocument(BaseModel):
     document_id: str
     customer_id: str
@@ -72,6 +97,8 @@ class KycDocument(BaseModel):
     rejection_reason: str | None = None
     submitted_at: datetime
     reviewed_at: datetime | None = None
+    # Set once the document has been through the async verification path.
+    verification: DocumentVerification | None = None
 
 
 class ServicingCase(BaseModel):
@@ -84,6 +111,28 @@ class ServicingCase(BaseModel):
     # Which conversation opened this, and who approved the write.
     session_id: str | None = None
     approved_by: str | None = None
+    # Appended by background work — currently the verification worker. A human
+    # picking the case up should see that a document was re-checked while the
+    # case sat in their queue, without having to go and look at the document.
+    updates: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class VerificationTask(BaseModel):
+    """The message `verify_kyc_document` puts on `servicing.tasks`.
+
+    A schema rather than a loose dict because it is the contract between two
+    processes that deploy independently — the MCP server produces it, the
+    worker consumes it, and nothing type-checks the wire between them. The
+    worker validates every message against this and drops what does not parse.
+    """
+
+    task_id: str
+    document_id: str
+    customer_id: str
+    # Carried across the process boundary so async work stays attributable to
+    # the turn that requested it — the audit trail does not stop at the queue.
+    correlation_id: str
+    requested_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class ToolAuditEntry(BaseModel):

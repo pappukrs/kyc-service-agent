@@ -27,12 +27,21 @@ class Settings(BaseSettings):
     kafka_bootstrap: str = "localhost:9092"
     kafka_tasks_topic: str = "servicing.tasks"
     kafka_audit_topic: str = "servicing.audit"
+    # How long a publish may take before it is treated as a broker outage. Short
+    # on purpose: this runs inside a customer's turn, and aiokafka's own
+    # bootstrap timeout is tens of seconds — long enough to look like a hang.
+    kafka_publish_timeout_seconds: float = 5.0
 
     # API
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     jwt_secret: str = "dev-only-change-me"
     log_level: str = "INFO"
+
+    # Worker — how long the simulated document check takes. There is no real
+    # scanner behind this; the delay is what makes the async path observable
+    # (the customer is told "in progress", the result lands later). Tests set 0.
+    verification_latency_seconds: float = 3.0
 
     # Agent
     agent_runtime: Literal["langgraph", "adk"] = "langgraph"

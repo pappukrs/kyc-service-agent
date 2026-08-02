@@ -188,15 +188,22 @@ async def test_agent_tool_calls_are_audited(seeded):
     assert "blurred" not in str(row)
 
 
-async def test_failed_tool_calls_are_audited_too(seeded):
+async def test_failed_tool_calls_are_audited_too(seeded, monkeypatch):
     """Failures are the calls you most want a record of."""
     from src.agent.graph import agent_session
+    from src.db import repositories
+
+    async def unavailable(*_args, **_kwargs):
+        raise ConnectionError("mongo is down")
+
+    # A tool that raises inside the MCP server — the shape of any genuine
+    # infrastructure failure underneath a tool.
+    monkeypatch.setattr(repositories, "find_documents", unavailable)
 
     model = ScriptedChatModel(
         responses=[
-            # Stubbed until Phase 7 — raises inside the MCP server.
-            tool_call("verify_kyc_document", {"document_id": "DOC-014-1"}),
-            AIMessage(content="I couldn't queue that."),
+            tool_call("list_kyc_documents", {"customer_id": "CUST-014"}),
+            AIMessage(content="I couldn't read those documents."),
         ]
     )
 

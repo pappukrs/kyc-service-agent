@@ -99,7 +99,7 @@ No model key? `MODEL_PROVIDER=ollama` runs it against a local model instead. And
 needs neither a key nor Docker:
 
 ```bash
-make test          # 63 passing, scripted model + in-memory Mongo
+make test          # 88 passing, scripted model + in-memory Mongo, no broker
 ```
 
 <details>
@@ -140,9 +140,9 @@ make mcp                                        # or: python -m src.mcp_server.s
 npx @modelcontextprotocol/inspector python -m src.mcp_server.server
 ```
 
-Six of the seven tools are implemented (`verify_kyc_document` lands in Phase 7). `list_kyc_documents`
-against a customer with a rejected document returns the rejection reason verbatim — that string
-is usually the whole answer to *"why am I blocked?"*.
+All seven tools are implemented. `list_kyc_documents` against a customer with a rejected document
+returns the rejection reason verbatim — that string is usually the whole answer to
+*"why am I blocked?"*.
 
 ### The approval gate
 
@@ -175,6 +175,38 @@ Four properties make this a gate rather than a suggestion:
 Contact updates are restricted by **allowlist** (`email`, `phone`, `city`), so a field added later
 is closed by default. Name and date of birth need a fresh KYC cycle, and there is no tool for them.
 
+### The async path
+
+Re-verification cannot finish inside a turn, so it does not try to. `verify_kyc_document` produces
+a task to `servicing.tasks` and returns `{"status": "queued", "task_id": "VER-…"}`; the worker
+(`make worker`) does the slow part and writes the result back minutes later.
+
+```bash
+docker compose up -d kafka    # if it isn't already up
+make worker                   # consumes servicing.tasks, group "kyc-verifier"
+```
+
+The behavioural risk this carries is a single sentence: **the agent must say verification is in
+progress, never that it succeeded.** Four things enforce it rather than hoping:
+
+- **There is no success to return.** The tool's result is `queued`; the outcome is decided by
+  another process after the turn has ended.
+- **The document moves to `verifying` at enqueue**, so a customer asking again two minutes later
+  sees progress instead of the old rejection — the read tools already render that state as "in
+  progress, no action needed".
+- **Redelivery is expected.** Kafka is at-least-once and the consumer commits *after* handling, so
+  the handler drops a task already recorded complete against that document. A replay cannot append
+  a second note to a case or emit a second audit event.
+- **A broker outage changes nothing.** The idempotency claim is released, the document is left
+  alone, and the tool returns `verification_unavailable` — a failed queue reported as success is
+  the worst outcome available here.
+
+The worker emits `kyc_document_verified` to `servicing.audit` carrying the correlation id of the
+turn that requested it, so what the agent asked for and what the system then did are joinable.
+Re-verification is deliberately *not* behind the approval gate: the agent asks the verification
+system to look again and does not get to choose what it finds. A tool that let it *set* a document
+to verified would be a write, and would go through the gate.
+
 ### The audit trail
 
 Every tool call the agent makes is appended to `tool_audit` — one immutable row, never updated,
@@ -198,7 +230,7 @@ trade for a servicing assistant; a system that moved money would fail closed ins
 ### Tests
 
 ```bash
-pytest -q      # 63 passing — no Docker, no API key
+pytest -q      # 88 passing — no Docker, no API key
 ```
 
 Data-access tests run against an in-memory Mongo (`mongomock-motor`) and agent tests drive a
@@ -241,8 +273,8 @@ See [`docs/PLAN.md`](docs/PLAN.md) for the phase-by-phase plan and acceptance te
 - [x] **Phase 4** — Mongo-backed conversation state + append-only tool audit
 - [x] **Phase 5** — write tools, idempotency, human-in-the-loop approval
 - [x] **Phase 6** — 🎯 **MVP cut**: rendered diagrams, `make demo`, tested walkthrough *(63 tests passing)*
-- [ ] **Phase 7** — Kafka producer + worker, async document verification
-- [ ] **Phase 8** — idempotency, per-tool timeout + retry policy
+- [x] **Phase 7** — Kafka producer + worker, async document verification *(88 tests passing)*
+- [ ] **Phase 8** — per-tool timeout + retry policy
 - [ ] **Phase 9** — 15-scenario eval harness in CI
 - [ ] **Phase 10** — structured logs, PII redaction, Prometheus metrics
 - [ ] **Phase 11** — Google ADK port behind the same MCP tools

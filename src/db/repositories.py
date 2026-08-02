@@ -46,6 +46,10 @@ async def find_customer(db: AsyncIOMotorDatabase, customer_id: str) -> dict[str,
     return await db.customers.find_one({"customer_id": customer_id}, _PROJECTION)
 
 
+async def find_document(db: AsyncIOMotorDatabase, document_id: str) -> dict[str, Any] | None:
+    return await db.kyc_documents.find_one({"document_id": document_id}, _PROJECTION)
+
+
 async def find_documents(db: AsyncIOMotorDatabase, customer_id: str) -> list[dict[str, Any]]:
     cursor = db.kyc_documents.find({"customer_id": customer_id}, _PROJECTION).sort("document_id", 1)
     return await cursor.to_list(length=None)
@@ -186,6 +190,33 @@ async def _store_idempotent_result(
     await db.idempotency_keys.update_one({"key": key}, {"$set": {"result": result}})
 
 
+async def claim_write(
+    db: AsyncIOMotorDatabase, *, scope: str, tool: str, arguments: dict[str, Any]
+) -> tuple[str, dict[str, Any] | None]:
+    """Public form of the claim: returns (key, prior result or None).
+
+    Used by writes that live outside this module — the verification enqueue in
+    `src.worker.verification` needs the same dedupe as `create_case`, and there
+    is no reason for it to own a second copy of the rule.
+    """
+    key = idempotency_key(scope, tool, arguments)
+    return key, await _claim_idempotency_key(db, key, tool)
+
+
+async def release_write(db: AsyncIOMotorDatabase, key: str) -> None:
+    """Drop an unfulfilled claim so a retry is not permanently deduped.
+
+    Only ever called when the write it guarded did *not* happen — a broker that
+    refused the message, say. A claim whose write succeeded is never released;
+    that is the whole point of it.
+    """
+    await db.idempotency_keys.delete_one({"key": key, "result": None})
+
+
+async def store_write_result(db: AsyncIOMotorDatabase, key: str, result: dict[str, Any]) -> None:
+    await _store_idempotent_result(db, key, result)
+
+
 async def create_case(
     db: AsyncIOMotorDatabase,
     *,
@@ -229,6 +260,88 @@ async def create_case(
     }
     await _store_idempotent_result(db, key, result)
     return result
+
+
+async def mark_document_verifying(
+    db: AsyncIOMotorDatabase, *, document_id: str, task_id: str, queued_at: datetime
+) -> None:
+    """Move a document into the `verifying` state the moment work is queued.
+
+    Without this a customer who asks again two minutes later is told their
+    document is still rejected, with nothing to indicate a re-check is running.
+    `verifying` already reads as "in progress, no action needed" in
+    build_onboarding_status, so the whole read path picks this up for free.
+    """
+    document = await find_document(db, document_id)
+    await db.kyc_documents.update_one(
+        {"document_id": document_id},
+        {
+            "$set": {
+                "status": DocumentStatus.VERIFYING.value,
+                "verification": {
+                    "task_id": task_id,
+                    "queued_at": queued_at,
+                    # The status this replaced. Load-bearing, not diagnostic:
+                    # `verifying` overwrites the very field the worker needs to
+                    # decide the outcome, and an expired document must stay
+                    # expired however many times it is re-checked.
+                    "previous_status": (document or {}).get("status"),
+                    "completed_at": None,
+                    "outcome": None,
+                },
+            }
+        },
+    )
+
+
+async def record_verification_outcome(
+    db: AsyncIOMotorDatabase,
+    *,
+    document_id: str,
+    task_id: str,
+    outcome: str,
+    reason: str | None,
+    completed_at: datetime,
+) -> None:
+    """Write the worker's decision onto the document.
+
+    A pass clears `rejection_reason`: leaving the old one behind would have the
+    read tools telling a customer with a now-verified document why it was once
+    rejected, which is exactly the sort of stale-field bug that erodes trust in
+    the answers.
+    """
+    await db.kyc_documents.update_one(
+        {"document_id": document_id},
+        {
+            "$set": {
+                "status": outcome,
+                "rejection_reason": reason,
+                "reviewed_at": completed_at,
+                "verification.task_id": task_id,
+                "verification.completed_at": completed_at,
+                "verification.outcome": outcome,
+            }
+        },
+    )
+
+
+async def append_case_update(
+    db: AsyncIOMotorDatabase, *, customer_id: str, update: dict[str, Any]
+) -> int:
+    """Append a note to the customer's live cases. Returns how many were touched.
+
+    Live means open or in progress — a resolved case is history and does not get
+    rewritten. `$push` rather than `$set` because a case accumulates events and
+    the human who picks it up needs the sequence, not the latest one.
+    """
+    result = await db.servicing_cases.update_many(
+        {
+            "customer_id": customer_id,
+            "status": {"$in": [CaseStatus.OPEN.value, CaseStatus.IN_PROGRESS.value]},
+        },
+        {"$push": {"updates": update}},
+    )
+    return result.modified_count
 
 
 async def update_contact(
