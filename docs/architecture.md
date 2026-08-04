@@ -1,6 +1,6 @@
 # Architecture
 
-Three diagrams and the reasoning behind them. The short version: **the agent has no direct
+Five diagrams and the reasoning behind them. The short version: **the agent has no direct
 database access.** Every capability it has is a typed MCP tool with an explicit contract, which is
 what makes the audit trail complete, the permission model enforceable, and the agent framework
 replaceable.
@@ -179,8 +179,9 @@ flowchart LR
     row --> f2["tool name"]
     row --> f3["arguments — keys kept,<br/>values redacted"]
     row --> f4["result — SHA-256 only,<br/>never the payload"]
-    row --> f5["latency_ms"]
-    row --> f6["approver — writes only"]
+    row --> f5["latency_ms — total,<br/>retries included"]
+    row --> f6["attempts + timed_out"]
+    row --> f7["approver — writes only"]
 
     classDef note fill:none,stroke-dasharray:3 3
     class f3,f4 note
@@ -198,9 +199,50 @@ Three rules keep this an audit log rather than a second copy of the customer dat
 An audit write failing never breaks a customer's turn — it is logged and swallowed. That is a
 deliberate trade for a servicing assistant; a system that moved money would fail closed instead.
 
+One row is one **tool call the agent made**, however many attempts it took underneath. That is why
+the retry lives in the bridge rather than in a middleware wrapping it: a middleware retries by
+re-running the tool, so the trail would show three `get_customer` calls with no way to tell a retry
+from the agent asking three times.
+
 ---
 
-## 5. Why MCP, and not just functions bound to the agent
+## 5. Bounds — what stops a turn running forever
+
+A tool that never answers and a model that never stops calling tools are the same failure seen from
+the customer's side: no reply. Both are bounded.
+
+```mermaid
+flowchart TD
+    call["tool call"] --> t{"answered within<br/>tool_timeout_seconds?"}
+    t -- yes --> ok["result → agent"]
+    t -- no --> r{"is it a read?"}
+    r -- "yes — asking twice is free" --> d{"deadline left?"}
+    r -- "no — it may have committed" --> unc["TOOL_ERROR: unconfirmed<br/>'do not say it worked<br/>or that it failed'"]
+    d -- yes --> call
+    d -- no --> to["TOOL_ERROR: tool_timeout<br/>'you do not have this'"]
+```
+
+| Bound | Where | What it stops |
+|---|---|---|
+| `tool_timeout_seconds` | per attempt, in the bridge | One wedged call holding the turn open |
+| `tool_deadline_seconds` | whole call, retries included | A retry policy multiplying the wait it was meant to bound |
+| `tool_retry_attempts` | **reads only** | Nothing — it is the recovery, not the bound |
+| `max_tool_calls_per_turn` | `ToolCallLimitMiddleware` | A model looping on tools instead of answering |
+
+The asymmetry is the design. A read is a question, so asking again is free and the second answer is
+as good as the first. A write is not: a timed-out `create_servicing_case` may already have committed
+— the timeout says the answer did not come back, not that the work did not happen. Retrying would be
+a guess about which, and the idempotency claim does not settle it either, since a retry in the same
+correlation scope collapses onto a claim whose result was never stored and returns
+`duplicate_in_progress`. So writes are attempted once and an unconfirmed write is reported as
+exactly that — the one case where the honest answer to the customer is "I don't know yet".
+
+Failure arrives as data, on the same contract as any other tool error: the agent reads it, the model
+composes the reply, and the turn ends normally. Nothing raises.
+
+---
+
+## 6. Why MCP, and not just functions bound to the agent
 
 Binding Python functions straight into the agent is fewer moving parts, and for a single-framework
 prototype it would be the right call. The MCP indirection buys three things that matter here:

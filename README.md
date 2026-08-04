@@ -54,8 +54,9 @@ model enforceable, and the agent framework swappable — the same tool surface r
 and under Google ADK.
 
 📐 **[`docs/architecture.md`](docs/architecture.md)** has the rendered diagrams: components, the
-approval gate as a sequence, what one turn writes to the audit trail, and why MCP rather than
-functions bound straight to the agent — including what that indirection costs.
+approval gate as a sequence, the async path, what one turn writes to the audit trail, what bounds a
+turn, and why MCP rather than functions bound straight to the agent — including what that
+indirection costs.
 
 ## Tool surface
 
@@ -99,7 +100,7 @@ No model key? `MODEL_PROVIDER=ollama` runs it against a local model instead. And
 needs neither a key nor Docker:
 
 ```bash
-make test          # 88 passing, scripted model + in-memory Mongo, no broker
+make test          # 111 passing, scripted model + in-memory Mongo, no broker
 ```
 
 <details>
@@ -207,6 +208,36 @@ Re-verification is deliberately *not* behind the approval gate: the agent asks t
 system to look again and does not get to choose what it finds. A tool that let it *set* a document
 to verified would be a write, and would go through the gate.
 
+### Bounds on a turn
+
+A tool that never answers and a model that never stops calling tools are the same failure from the
+customer's side: no reply. Every tool call is bounded (`TOOL_TIMEOUT_SECONDS` per attempt,
+`TOOL_DEADLINE_SECONDS` for the whole call), and a turn is capped at `MAX_TOOL_CALLS_PER_TURN`.
+
+**Only reads are retried, and that asymmetry is the point.** A read is a question — asking twice is
+free. A write is not: a timed-out `create_servicing_case` may already have committed, because the
+timeout says the answer never came back, not that the work never happened. So a write is attempted
+once and the agent is handed the honest version:
+
+```jsonc
+TOOL_ERROR from create_servicing_case: {
+  "error": "tool_timeout", "attempts": 1, "elapsed_ms": 15003,
+  "detail": "TimeoutError",          // the exception *type* — never its message, which
+                                     // can carry a connection string or customer data
+  "message": "This action was attempted once and did not confirm. It may or may not have
+              taken effect… Do NOT tell the customer it succeeded and do NOT tell them it
+              failed."
+}
+```
+
+Two smaller decisions worth naming. The retry lives in the MCP bridge rather than in LangChain's
+`ToolRetryMiddleware`, because that middleware retries by re-running the tool — three attempts would
+write three audit rows, and a reader could not tell a retry from the agent asking three times. One
+tool call stays one row, carrying `attempts`. The *turn* cap is the opposite call:
+`ToolCallLimitMiddleware` is exactly right and is used as shipped, in `continue` mode so the model
+is told to stop calling tools and answer from what it has — `end` mode would hand the customer the
+framework's own *"run limit exceeded (9/8 calls)"*.
+
 ### The audit trail
 
 Every tool call the agent makes is appended to `tool_audit` — one immutable row, never updated,
@@ -230,7 +261,7 @@ trade for a servicing assistant; a system that moved money would fail closed ins
 ### Tests
 
 ```bash
-pytest -q      # 88 passing — no Docker, no API key
+pytest -q      # 111 passing — no Docker, no API key
 ```
 
 Data-access tests run against an in-memory Mongo (`mongomock-motor`) and agent tests drive a
@@ -274,7 +305,7 @@ See [`docs/PLAN.md`](docs/PLAN.md) for the phase-by-phase plan and acceptance te
 - [x] **Phase 5** — write tools, idempotency, human-in-the-loop approval
 - [x] **Phase 6** — 🎯 **MVP cut**: rendered diagrams, `make demo`, tested walkthrough *(63 tests passing)*
 - [x] **Phase 7** — Kafka producer + worker, async document verification *(88 tests passing)*
-- [ ] **Phase 8** — per-tool timeout + retry policy
+- [x] **Phase 8** — per-tool timeout + retry policy, turn-level tool-call cap *(111 tests passing)*
 - [ ] **Phase 9** — 15-scenario eval harness in CI
 - [ ] **Phase 10** — structured logs, PII redaction, Prometheus metrics
 - [ ] **Phase 11** — Google ADK port behind the same MCP tools

@@ -37,6 +37,21 @@ mcp = MCPServer(
 )
 
 
+# The tool names, grouped by blast radius. They live here because this module is
+# the authority on what tools exist — the read-only binding (Phase 3), the
+# approval gate (Phase 5) and the retry policy (Phase 8) all classify tools this
+# way, and three private copies of these names would be three chances to drift.
+READ_TOOLS: tuple[str, ...] = (
+    "get_customer",
+    "get_onboarding_status",
+    "list_kyc_documents",
+    "search_servicing_kb",
+)
+ASYNC_TOOLS: tuple[str, ...] = ("verify_kyc_document",)
+WRITE_TOOLS: tuple[str, ...] = ("create_servicing_case", "update_customer_contact")
+ALL_TOOLS: tuple[str, ...] = READ_TOOLS + ASYNC_TOOLS + WRITE_TOOLS
+
+
 def _not_found(customer_id: str) -> dict:
     """Uniform not-found result.
 

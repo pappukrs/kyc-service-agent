@@ -2,10 +2,11 @@
 
 Where the project is, what's left, and why the load-bearing decisions went the way they did.
 
-**Shipped:** Phases 0–7 · **88 tests passing** · no Docker, broker or API key required to run them.
+**Shipped:** Phases 0–8 · **111 tests passing** · no Docker, broker or API key required to run them.
 The system is functionally complete end to end: a servicing request comes in, the agent reads real
-data through MCP, answers, any write it wants to make pauses for a human, and work too slow for a
-turn goes on a queue and lands back on the customer's record later.
+data through MCP, answers, any write it wants to make pauses for a human, work too slow for a turn
+goes on a queue and lands back on the customer's record later, and nothing that fails underneath can
+hold the turn open indefinitely.
 
 ---
 
@@ -21,7 +22,7 @@ turn goes on a queue and lands back on the customer's record later.
 | 5 | Write gate | ✅ | Both write tools, idempotency, `POST /sessions/{id}/approve` |
 | 6 | Presentation | ✅ | Rendered diagrams, `make demo`, tested end-to-end walkthrough |
 | 7 | Async work | ✅ | Kafka producer + worker, `verify_kyc_document`, at-least-once handling |
-| 8 | Resilience | ▫️ | Per-tool timeout + retry policy |
+| 8 | Resilience | ✅ | Per-tool timeout + deadline, reads retried, turn-level tool-call cap |
 | 9 | Evals | ▫️ | 15-scenario suite, 4 assertion types, in CI |
 | 10 | Observability | ▫️ | Structured logs, PII redaction, Prometheus metrics, token/cost counters |
 | 11 | ADK port | ▫️ | Google ADK runtime behind the same MCP tools |
@@ -118,14 +119,39 @@ Three things the queue forced that the synchronous path never had to think about
   document is untouched, and the tool returns `verification_unavailable` with instructions to say
   so. A queued-but-lost verification the customer has been told about is the worst outcome here.
 
+### Phase 8 — Resilience
+Every tool call is bounded — `tool_timeout_seconds` per attempt, `tool_deadline_seconds` for the
+whole call — and a turn is capped at `max_tool_calls_per_turn`. Tool errors already returned as
+data; what had no handling was *no answer at all*, because it had no end.
+
+The load-bearing decision is which calls may be retried:
+
+- **Reads are retried, writes are not.** A read is a question and the second answer is as good as
+  the first. A timed-out write may already have committed — the timeout says the answer did not come
+  back, not that the work did not happen. Retrying is a guess about which, and the idempotency claim
+  does not settle it: a retry inside the same correlation scope collapses onto a claim whose result
+  was never stored and returns `duplicate_in_progress`. So a write is attempted once and reported as
+  **unconfirmed**, with the agent told plainly not to say it succeeded *or* that it failed.
+  `verify_kyc_document` sits in the same bucket — it claims a key and publishes to Kafka.
+- **Retryable means "no answer", not "an answer we didn't like".** An MCP `is_error` result means
+  the server ran the tool and said how it went. Some of those would pass on a second attempt, but
+  most (unknown document, bad argument) are deterministic, and telling them apart would mean parsing
+  the server's error strings. Timeouts and transport failures classify with certainty; those are the
+  ones retried.
+- **A deadline, not just a timeout.** Three attempts at fifteen seconds is forty-five seconds of a
+  customer watching a spinner. Each attempt gets the lesser of its own timeout and what is left of
+  the call's budget, and an attempt that cannot finish inside the budget is not started.
+- **Failure carries the exception type, never its message.** An exception string can hold a
+  connection string, a query fragment, or customer data, and this payload goes into the model's
+  context and the conversation transcript.
+
+`ToolCallLimitMiddleware` is used as shipped for the turn cap, in `continue` mode — the model is
+told to stop calling tools and answer from what it has, where `end` mode would hand the customer the
+framework's own "run limit exceeded (9/8 calls)".
+
 ---
 
 ## Remaining
-
-### Phase 8 — Resilience
-Per-tool timeout and retry policy. Today a slow tool blocks the turn indefinitely. Tool errors
-already return as data (`TOOL_ERROR from …`) rather than raising, so the agent can recover — but
-there is no bound on how long it waits first.
 
 ### Phase 9 — Evaluation suite
 `evals/scenarios.yaml` has 5 of a planned 15 scenarios and no runner. Four assertion types:
@@ -137,9 +163,10 @@ there is no bound on how long it waits first.
 - **refusal** — out-of-scope requests declined rather than hallucinating a capability
 
 This is the phase that tests *judgement* rather than wiring, and it needs a real model. The existing
-88 tests deliberately cover only mechanics; conflating the two would make both weaker. Phase 7 added
-the scenario this suite most needs: a re-check that has been *requested* must never be described as
-one that *passed*.
+111 tests deliberately cover only mechanics; conflating the two would make both weaker. Phases 7 and
+8 each added a scenario this suite needs, and they are the same kind of failure: a re-check that has
+been *requested* must never be described as one that *passed*, and a write that timed out must never
+be described as one that succeeded — or as one that failed.
 
 ### Phase 10 — Observability
 Structured JSON logs carrying the correlation id, PII redaction at the log boundary, Prometheus
@@ -200,6 +227,26 @@ agent *asked* for verification; `servicing.audit` records what the system then *
 process, after the turn ended. Both carry the correlation id, so the two halves join. Writing the
 async half into `tool_audit` would have made "every row is a tool call the agent made" false.
 
+**Reads are retried; writes get one attempt and an honest "unconfirmed".** The alternative — retry
+everything and lean on the idempotency key — fails in the exact case it is needed: the first attempt
+claimed the key and timed out before storing a result, so the retry returns `duplicate_in_progress`,
+which means "something happened, unclear what". Better to attempt once and say so than to attempt
+twice and still not know. The customer-facing rule falls out of it: after a failed write the agent
+must not claim success *or* failure.
+
+**The retry lives in the MCP bridge, not in `ToolRetryMiddleware`.** The shipped middleware handles
+backoff and per-tool selection well, but it has no notion of a time bound — which is the half that
+matters, since retrying without a deadline just multiplies the wait. And it retries by re-running
+the tool, so each attempt writes its own audit row: the trail would show three `get_customer` calls
+with no way to distinguish a retry from the agent asking three times. Retrying inside the bridge
+keeps one tool call to one row and records `attempts` on it. The turn cap went the other way —
+`ToolCallLimitMiddleware` is exactly right for that and is used as shipped.
+
+**Tool names are classified by blast radius in the MCP server.** `READ_TOOLS` / `ASYNC_TOOLS` /
+`WRITE_TOOLS` live beside the tool definitions, because the read-only binding, the approval gate and
+the retry policy all classify the same seven names — three private copies would be three chances to
+drift. A test asserts the classification still covers exactly what the server advertises.
+
 **Contact updates are an allowlist, not a denylist.** `email`, `phone`, `city`. A field added to the
 model later is closed by default rather than silently writable.
 
@@ -223,6 +270,14 @@ Being explicit about what has **not** been demonstrated, as distinct from what i
   against an in-memory publisher — the enqueue, the outcomes, redelivery, case updates and the
   audit event. What that does not exercise is aiokafka itself: `consumer.py`'s loop, the manual
   commit, and the group rebalance are unproven outside a live broker.
+- **Timeouts are proven against an in-process MCP server.** The bound, the retry, the deadline and
+  the audit row are all tested — by making a repository call hang, which is a faithful stand-in for
+  a wedged database. What it does not exercise is a timeout across a real transport, where the
+  server keeps working on a call the client has already given up on. Nothing downstream depends on
+  the client waiting, but it has not been watched happen.
+- **The turn cap is soft.** `continue` mode blocks further tool calls and tells the model to answer;
+  a model that ignored that and kept asking would loop until LangGraph's recursion limit stopped it.
+  That backstop is the framework's default, not something this project sets.
 - **No authentication.** `JWT_SECRET` is in config and unused; every endpoint is open. Fine for a
   local demo, not for anything else.
 - **The approver is whoever the caller says it is.** `POST /approve` takes an `approver` string on

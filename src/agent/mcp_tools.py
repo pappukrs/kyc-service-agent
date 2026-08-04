@@ -31,6 +31,8 @@ from langchain_core.tools import StructuredTool
 from mcp.client.client import Client
 from mcp.server.mcpserver import MCPServer
 
+from src.agent import resilience
+from src.mcp_server.server import READ_TOOLS
 from src.obs import audit
 
 
@@ -62,15 +64,27 @@ def _make_tool(
         # tool wrapper having to know anything about the API above it.
         session_id = (config.get("configurable") or {}).get("thread_id", "unknown")
 
+        # Bounded and, for reads, retried — see src/agent/resilience.py for why
+        # the retry stops at the read tools. Doing it here rather than in a
+        # middleware keeps one tool call to one audit row.
+        policy = resilience.policy_for(name)
+
         started = time.perf_counter()
-        result = await client.call_tool(name, kwargs)
+        outcome = await resilience.call_with_policy(policy, lambda: client.call_tool(name, kwargs))
         latency_ms = int((time.perf_counter() - started) * 1000)
 
         # A tool-level error is data, not an exception: the agent should read it
         # and recover (ask a clarifying question, try another tool) rather than
-        # having the turn blow up underneath it.
-        is_error = bool(getattr(result, "is_error", False))
-        payload = _flatten_result(result)
+        # having the turn blow up underneath it. A call that ran out of time is
+        # the same contract — it just has to say so itself, because the server
+        # never got the chance to.
+        if outcome.ok:
+            is_error = bool(getattr(outcome.result, "is_error", False))
+            payload = _flatten_result(outcome.result)
+        else:
+            is_error = True
+            payload = json.dumps(resilience.failure_payload(name, outcome, elapsed_ms=latency_ms))
+
         rendered = f"TOOL_ERROR from {name}: {payload}" if is_error else payload
 
         # Every tool call is audited — including the failures, which are the
@@ -83,6 +97,10 @@ def _make_tool(
             latency_ms=latency_ms,
             is_error=is_error,
             error_message=payload if is_error else None,
+            # How many attempts this one call took, so the trail distinguishes
+            # a retry from the agent asking the same question twice.
+            attempts=outcome.attempts,
+            timed_out=outcome.timed_out,
         )
 
         return rendered
@@ -118,13 +136,7 @@ async def load_read_tools(client: Client) -> list[StructuredTool]:
     never happen — if the tool is not bound, no prompt can talk the model into
     calling it. Defence in depth alongside the Phase 5 approval gate.
     """
-    read_only = {
-        "get_customer",
-        "get_onboarding_status",
-        "list_kyc_documents",
-        "search_servicing_kb",
-    }
-    return [t for t in await load_mcp_tools(client) if t.name in read_only]
+    return [t for t in await load_mcp_tools(client) if t.name in READ_TOOLS]
 
 
 def connect(server: MCPServer) -> Client:

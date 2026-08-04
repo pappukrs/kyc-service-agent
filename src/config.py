@@ -45,8 +45,20 @@ class Settings(BaseSettings):
 
     # Agent
     agent_runtime: Literal["langgraph", "adk"] = "langgraph"
+
+    # Bounds on a turn. A tool that never returns and a model that never stops
+    # calling tools are the same failure seen from the customer's side: no
+    # answer. Both are bounded here rather than left to whatever the process
+    # underneath decides to do.
     max_tool_calls_per_turn: int = 8
-    tool_timeout_seconds: int = 15
+    tool_timeout_seconds: float = 15.0
+    # Total attempts for a tool that may be retried at all — 1 means "no retry".
+    tool_retry_attempts: int = 3
+    tool_retry_backoff_seconds: float = 0.25
+    # The whole call, retries and backoff included. Without this, a retry policy
+    # only multiplies the wait it was meant to bound: 3 × 15s is 45s of a
+    # customer looking at a spinner.
+    tool_deadline_seconds: float = 25.0
 
 
 @lru_cache

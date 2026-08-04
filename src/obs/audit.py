@@ -130,6 +130,8 @@ async def record_tool_call(
     is_error: bool = False,
     error_message: str | None = None,
     approved_by: str | None = None,
+    attempts: int = 1,
+    timed_out: bool = False,
 ) -> None:
     """Append one immutable row describing a tool invocation."""
     entry = {
@@ -140,6 +142,12 @@ async def record_tool_call(
         "result_sha256": hash_result(result),
         "result_bytes": len(result.encode("utf-8")),
         "latency_ms": latency_ms,
+        # One row per tool call the agent made, however many attempts it took —
+        # so the trail never reads as though the agent asked the same question
+        # twice when it was the bridge retrying. `latency_ms` is the total the
+        # customer waited, retries and backoff included.
+        "attempts": attempts,
+        "timed_out": timed_out,
         "is_error": is_error,
         "error_message": error_message,
         # Set for approved writes, None for reads. Falls back to the ambient
