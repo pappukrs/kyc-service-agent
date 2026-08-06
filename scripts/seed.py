@@ -11,7 +11,12 @@ from datetime import UTC, datetime, timedelta
 from src.db import mongo
 from src.domain.models import DocumentStatus, DocumentType, OnboardingStage, RiskTier
 
-random.seed(42)  # reproducible dataset — the eval suite depends on it
+# Reproducible dataset — the eval scenarios name specific customer ids, so this
+# is load-bearing rather than a nicety. Named because `main()` can be called more
+# than once in a process (the eval harness seeds a fresh database per scenario)
+# and the module-level call below only ever fires on import.
+RANDOM_SEED = 42
+random.seed(RANDOM_SEED)
 
 FIRST = ["Aarav", "Diya", "Kabir", "Isha", "Rohan", "Meera", "Arjun", "Sana", "Vikram", "Neha"]
 LAST = ["Sharma", "Iyer", "Nair", "Bose", "Reddy", "Kulkarni", "Menon", "Chopra", "Das", "Rao"]

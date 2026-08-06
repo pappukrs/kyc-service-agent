@@ -1,4 +1,4 @@
-.PHONY: demo up down seed run worker test lint mcp
+.PHONY: demo up down seed run worker test eval lint mcp
 
 demo:    ## clean clone → working demo: Mongo, seed, API, end-to-end walkthrough
 	./scripts/demo.sh
@@ -21,8 +21,11 @@ worker:  ## start the Kafka worker
 mcp:     ## run the MCP server standalone (for MCP Inspector)
 	python -m src.mcp_server.server
 
-test:
+test:    ## mechanics — no API key, no Docker, no broker
 	pytest -q
+
+eval:    ## judgement — needs a real model (MODEL_API_KEY in .env)
+	python -m evals.runner
 
 lint:
 	ruff check . && ruff format --check .

@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Everything that costs nothing and is fully deterministic. No Docker, no
+  # broker, no API key — the suite runs against an in-memory Mongo and a
+  # scripted fake model, which is what makes it usable as a gate on every push.
+  checks:
+    name: lint + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pytest -q
+
+  # The eval suite tests judgement, so it needs a real model — which means it
+  # costs money and is not perfectly deterministic. Both of those make it a
+  # poor fit for the gate above and a good fit for its own job.
+  #
+  # Gated on the secret being present, not just on the event: a fork's pull
+  # request has no access to it, and the alternative to skipping is sixteen
+  # scenarios failing with an auth error and looking like the agent got
+  # everything wrong.
+  evals:
+    name: evals (real model)
+    runs-on: ubuntu-latest
+    needs: checks
+    if: ${{ github.event_name != 'pull_request' && vars.EVAL_PROVIDER_PACKAGE != '' }}
+    env:
+      MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
+      MODEL_NAME: ${{ vars.MODEL_NAME }}
+      MODEL_API_KEY: ${{ secrets.MODEL_API_KEY }}
+      EVAL_JUDGE_MODEL: ${{ vars.EVAL_JUDGE_MODEL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      # The provider SDK is deliberately not a project dependency — the model
+      # factory imports lazily so you only install the one you configured.
+      - run: pip install -e ".[dev]" "${{ vars.EVAL_PROVIDER_PACKAGE }}"
+      - run: python -m evals.runner

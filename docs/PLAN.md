@@ -2,11 +2,12 @@
 
 Where the project is, what's left, and why the load-bearing decisions went the way they did.
 
-**Shipped:** Phases 0–8 · **111 tests passing** · no Docker, broker or API key required to run them.
+**Shipped:** Phases 0–9 · **183 tests passing** · no Docker, broker or API key required to run them.
 The system is functionally complete end to end: a servicing request comes in, the agent reads real
 data through MCP, answers, any write it wants to make pauses for a human, work too slow for a turn
 goes on a queue and lands back on the customer's record later, and nothing that fails underneath can
-hold the turn open indefinitely.
+hold the turn open indefinitely. As of Phase 9 there is also a suite that asks whether the answers
+are any *good* — 16 scenarios against a real model, which the 183 above deliberately do not cover.
 
 ---
 
@@ -23,7 +24,7 @@ hold the turn open indefinitely.
 | 6 | Presentation | ✅ | Rendered diagrams, `make demo`, tested end-to-end walkthrough |
 | 7 | Async work | ✅ | Kafka producer + worker, `verify_kyc_document`, at-least-once handling |
 | 8 | Resilience | ✅ | Per-tool timeout + deadline, reads retried, turn-level tool-call cap |
-| 9 | Evals | ▫️ | 15-scenario suite, 4 assertion types, in CI |
+| 9 | Evals | ✅ | 16-scenario suite, mechanical + model-judged assertions, in CI |
 | 10 | Observability | ▫️ | Structured logs, PII redaction, Prometheus metrics, token/cost counters |
 | 11 | ADK port | ▫️ | Google ADK runtime behind the same MCP tools |
 
@@ -149,24 +150,51 @@ The load-bearing decision is which calls may be retried:
 told to stop calling tools and answer from what it has, where `end` mode would hand the customer the
 framework's own "run limit exceeded (9/8 calls)".
 
+### Phase 9 — Evaluation suite
+Sixteen scenarios in `evals/scenarios.yaml`, run against the production agent — the real MCP
+server, the real approval gate, the real retry policy — and a real model. The database and the
+broker are in-memory; the model emphatically is not. This is the first thing in the project that
+tests *judgement*, and every earlier phase deliberately avoided it: a fake model cannot be asked
+whether it picked the right tool, because the script and not the model decides.
+
+Coverage tracks the phases. Reading and grounding (rejection reasons explained, every rejection
+surfaced rather than just the first, an unknown id not papered over, a follow-up answered from
+context rather than re-fetched); scope (money movement refused, ambiguity questioned rather than
+guessed at); the gate (a write pauses, an approved one lands, a refused one writes nothing); and
+the two failure modes Phases 7 and 8 introduced — a re-check that was *requested* must never be
+described as one that *passed*, and a timed-out write must be reported as neither success nor
+failure. One scenario is a prompt injection planted in a rejection reason, on a fixture customer
+that exists only here.
+
+The load-bearing decisions:
+
+- **Mechanically first, judged second.** A scenario that called the wrong tool has already failed;
+  grading the prose it wrote off the back of that spends two API calls to tell you what you know,
+  and occasionally reports a "grounded" pass on an answer built from a lookup that should never
+  have happened. As much stays on the mechanical side as the questions allow — those failures are
+  facts about the run, cost nothing, and cannot be argued with.
+- **Tool selection is read from the transcript; write safety from `tool_audit`.** A write the model
+  requested and the gate then parked is a correct call *and* a write that did not happen. Asserting
+  both against one source makes one of the two questions unanswerable.
+- **The judge sees only what the tools returned.** Not the database, not the scenario's intent, not
+  the customer id — so it cannot rationalise an unsupported claim as true. That is the same
+  standard the agent is held to.
+- **A failure must quote the sentence.** A verdict naming no specific claim is downgraded to a
+  pass. A deliberate bias towards false negatives: an eval that fails for reasons a human cannot
+  check is one people learn to ignore, and a suite nobody trusts catches nothing at all.
+- **The harness is itself under test, without a key.** That the scenario file is well-formed, that
+  a paused write leaves no audit row and an approved one does, that an unsubstantiated verdict is
+  not counted. Including a tripwire on the seed: change it and the scenarios naming CUST-019 and
+  CUST-020 do not fail, they quietly become tests of nothing and stay green.
+
+CI runs in two jobs. Lint and the 183 tests gate every push — deterministic, free, no key. The
+evals are their own job, gated on the secret being present rather than on the event, because a
+fork's pull request cannot see it and the alternative to skipping is sixteen scenarios failing with
+an auth error and looking like the agent got everything wrong.
+
 ---
 
 ## Remaining
-
-### Phase 9 — Evaluation suite
-`evals/scenarios.yaml` has 5 of a planned 15 scenarios and no runner. Four assertion types:
-
-- **tool selection** — was the right tool called? catches over- and under-calling
-- **no unapproved writes** — asserted against `tool_audit`, not the transcript; the transcript is
-  what the model *said*, the audit log is what actually happened
-- **grounded** — every factual claim traces to a tool result
-- **refusal** — out-of-scope requests declined rather than hallucinating a capability
-
-This is the phase that tests *judgement* rather than wiring, and it needs a real model. The existing
-111 tests deliberately cover only mechanics; conflating the two would make both weaker. Phases 7 and
-8 each added a scenario this suite needs, and they are the same kind of failure: a re-check that has
-been *requested* must never be described as one that *passed*, and a write that timed out must never
-be described as one that succeeded — or as one that failed.
 
 ### Phase 10 — Observability
 Structured JSON logs carrying the correlation id, PII redaction at the log boundary, Prometheus
@@ -261,11 +289,23 @@ superseded SDK or own ~50 lines of glue; `src/agent/mcp_tools.py` is the glue.
 
 Being explicit about what has **not** been demonstrated, as distinct from what is unimplemented.
 
-- **Nothing has run against real MongoDB or a real model.** The suite runs against
-  `mongomock-motor` and a scripted fake chat model. Query shapes are ordinary and the unique index
-  idempotency depends on is honoured by mongomock, but the `MongoDBSaver` path specifically has not
-  been exercised against a live server.
-- **No test covers model judgement.** By design — see Phase 9.
+- **Nothing has run against real MongoDB.** Both suites run against `mongomock-motor`. Query shapes
+  are ordinary and the unique index idempotency depends on is honoured by mongomock, but the
+  `MongoDBSaver` path specifically has not been exercised against a live server.
+- **The eval suite has not been run against a real model.** This is the sharpest gap on the list,
+  and it is about this checkout rather than the code: no `MODEL_API_KEY` is configured, so all 16
+  scenarios skip. What is proven is everything around them — the harness, the assertions, the
+  judge's substantiation rule, the fixture preconditions, all under test with a scripted model. What
+  is unproven is the agent's judgement itself, which is the one thing the suite exists to measure.
+  Until it runs green against a real model, treat the scenarios as *written*, not as *passing*.
+- **The judge defaults to the agent's own model.** Which grades its own output more kindly than it
+  should. `EVAL_JUDGE_MODEL` fixes it and any result worth quoting should set it — but the default
+  is the weaker arrangement, not the stronger one.
+- **The eval suite is sequential and not perfectly deterministic.** Scenarios patch process-global
+  state (the database, the publisher, the resilience bounds), so two running at once would evaluate
+  a system neither described. The honest fix is to inject rather than patch. And a real model at
+  `temperature=0` is still not a guarantee: an occasional flake is a property of the suite, so a
+  single red scenario is a prompt to read the reply, not automatically a regression.
 - **Nothing has run against a real Kafka broker.** The verification feature is tested end to end
   against an in-memory publisher — the enqueue, the outcomes, redelivery, case updates and the
   audit event. What that does not exercise is aiokafka itself: `consumer.py`'s loop, the manual

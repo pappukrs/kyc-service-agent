@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     # Agent
     agent_runtime: Literal["langgraph", "adk"] = "langgraph"
 
+    # Evals. The judge defaults to the agent's own model, which grades its own
+    # output more kindly than it should. Point this at a different model for any
+    # result you intend to quote at somebody.
+    eval_judge_model: str = ""
+
     # Bounds on a turn. A tool that never returns and a model that never stops
     # calling tools are the same failure seen from the customer's side: no
     # answer. Both are bounded here rather than left to whatever the process

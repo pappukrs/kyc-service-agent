@@ -100,7 +100,8 @@ No model key? `MODEL_PROVIDER=ollama` runs it against a local model instead. And
 needs neither a key nor Docker:
 
 ```bash
-make test          # 111 passing, scripted model + in-memory Mongo, no broker
+make test          # 183 passing, scripted model + in-memory Mongo, no broker
+make eval          # 16 scenarios against a real model — needs MODEL_API_KEY
 ```
 
 <details>
@@ -261,7 +262,7 @@ trade for a servicing assistant; a system that moved money would fail closed ins
 ### Tests
 
 ```bash
-pytest -q      # 111 passing — no Docker, no API key
+pytest -q      # 183 passing — no Docker, no API key
 ```
 
 Data-access tests run against an in-memory Mongo (`mongomock-motor`) and agent tests drive a
@@ -269,9 +270,49 @@ scripted fake model, so the wiring is genuinely exercised rather than mocked. Th
 under the same harness, over an in-process ASGI transport — a walkthrough nobody runs until
 interview day is a walkthrough that has quietly rotted.
 
-What these *don't* cover is model judgement — "did it pick the right tool for this question?" needs
-a real model, and that's what the Phase 9 eval suite is for. Docker is only needed for the live
-end-to-end run.
+What these *don't* cover is model judgement — "did it pick the right tool for this question?"
+cannot be asked of a fake model, because the script and not the model decides. That is the eval
+suite's job, below. Docker is only needed for the live end-to-end run.
+
+### Evals
+
+```bash
+make eval                                          # all 16 scenarios
+python -m evals.runner --only refuses-money-movement
+python -m evals.runner --list                      # what exists, without spending a token
+```
+
+Sixteen scenarios in [`evals/scenarios.yaml`](evals/scenarios.yaml), run against the *real* agent —
+the real MCP server, the real approval gate, the real retry policy — and a real model. Only the
+database and the broker are swapped for in-memory ones, because what is under test here is
+judgement, not MongoDB's.
+
+Each scenario is checked mechanically first and by a second model only if that passes; grading the
+prose an agent wrote off the back of the wrong tool call tells you nothing you didn't know. The
+mechanical half asks what happened — was the right tool called, did the run pause, and, read off
+`tool_audit` rather than the transcript, did a write actually execute. The judged half asks the
+questions a string match cannot: is every claim traceable to a tool result, was an out-of-scope
+request declined, and — the Phase 7 distinction — does the reply describe a re-check as *requested*
+rather than *completed*.
+
+Two rules keep the judged half honest. The judge sees only what the tools returned, never the
+database, so it cannot rationalise an unsupported claim as true. And a failure must quote the
+offending sentence — a verdict that names no claim is downgraded to a pass, because an eval that
+fails for reasons a human cannot check is one people learn to ignore.
+
+`EVAL_JUDGE_MODEL` points the judge at a different model from the agent's. Left blank it grades its
+own homework, which it does more kindly than it should.
+
+One caveat worth stating plainly: these scenarios have not yet been run against a real model — no
+key is configured in this checkout, so they skip. Everything *around* them is tested (below), but
+the scenarios themselves should be read as written rather than as passing. See
+[Known gaps](docs/PLAN.md#known-gaps).
+
+The harness itself is under test (`tests/test_evals.py`) and that part needs no key: that the
+scenario file is well-formed, that a paused write leaves no audit row and an approved one does,
+that an unsubstantiated verdict is not counted. There is also a tripwire asserting the seed still
+contains the states the scenarios were written against — otherwise a changed seed does not fail
+those scenarios, it quietly turns them into tests of nothing, still green.
 
 ### Two SDK notes worth knowing before you read the code
 
@@ -306,7 +347,7 @@ See [`docs/PLAN.md`](docs/PLAN.md) for the phase-by-phase plan and acceptance te
 - [x] **Phase 6** — 🎯 **MVP cut**: rendered diagrams, `make demo`, tested walkthrough *(63 tests passing)*
 - [x] **Phase 7** — Kafka producer + worker, async document verification *(88 tests passing)*
 - [x] **Phase 8** — per-tool timeout + retry policy, turn-level tool-call cap *(111 tests passing)*
-- [ ] **Phase 9** — 15-scenario eval harness in CI
+- [x] **Phase 9** — 16-scenario eval harness, model-judged assertions, CI *(183 tests passing)*
 - [ ] **Phase 10** — structured logs, PII redaction, Prometheus metrics
 - [ ] **Phase 11** — Google ADK port behind the same MCP tools
 - [ ] **Phase 12** — architecture diagram, demo video, deploy
